@@ -9,9 +9,6 @@ pub struct Transformer {
     pub blocks: Vec<TransformerBlock>,
     pub final_norm: RmsNorm,
     pub unembedding: Tensor,
-    pub config: ModelConfig,
-    pub device: Device,
-    pub dtype: DType,
 }
 
 pub struct TransformerBlock {
@@ -83,9 +80,6 @@ impl Transformer {
             blocks,
             final_norm,
             unembedding,
-            config,
-            device,
-            dtype,
         })
     }
 
@@ -198,8 +192,8 @@ impl AttentionBlock {
         let kt = k.transpose(1, 2)?.contiguous()?;
         let mut scores = q.matmul(&kt)?;
 
-        // Causal sliding-window mask.
-        let mask = causal_sliding_mask(t, self.sliding_window, device, dtype)?; // [T, T]
+        // Bidirectional sliding-window mask (this checkpoint is bidirectional with half-width 128).
+        let mask = bidirectional_sliding_mask(t, self.sliding_window, device, dtype)?; // [T, T]
         scores = scores.broadcast_add(&mask.unsqueeze(0)?)?; // [nq, T, T]
 
         // Attention sinks: append one virtual key per head with logit = sink * ln(2).
@@ -363,13 +357,22 @@ fn repeat_kv(t: &Tensor, q_mult: usize) -> Result<Tensor> {
     expanded.reshape((nkv * q_mult, seq, d)).map_err(Into::into)
 }
 
-fn causal_sliding_mask(t: usize, window: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+/// Bidirectional sliding-window mask: query i attends to keys in [i-window, i+window].
+/// The HF config's `sliding_window` value is the *half-width*; total window size is
+/// 2*window + 1. The opf runtime requires `bidirectional_context=true` for all checkpoints.
+fn bidirectional_sliding_mask(
+    t: usize,
+    window: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
     let neg_inf = f32::NEG_INFINITY;
     let mut data = vec![0f32; t * t];
     for i in 0..t {
         let lo = i.saturating_sub(window);
+        let hi = (i + window).min(t - 1);
         for j in 0..t {
-            if j < lo || j > i {
+            if j < lo || j > hi {
                 data[i * t + j] = neg_inf;
             }
         }

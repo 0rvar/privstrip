@@ -1,3 +1,5 @@
 /target
 *.safetensors
 tokenizer.json
+/python-ref/.venv
+/python-ref/.direnv

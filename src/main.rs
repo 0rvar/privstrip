@@ -192,11 +192,8 @@ fn pick_device(force_cpu: bool) -> Result<Device> {
     if force_cpu {
         return Ok(Device::Cpu);
     }
-    #[cfg(feature = "metal")]
-    {
-        if let Ok(d) = Device::new_metal(0) {
-            return Ok(d);
-        }
+    if let Ok(d) = Device::new_metal(0) {
+        return Ok(d);
     }
     Ok(Device::Cpu)
 }
