@@ -21,6 +21,14 @@ use crate::spans::{DetectedSpan, extract_spans, redact};
 use crate::viterbi::ViterbiDecoder;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum DecoderMode {
+    /// Constraint-aware decoding: rejects malformed BIES sequences.
+    Viterbi,
+    /// Independent per-token argmax. Matches transformers.js's stock pipeline.
+    Argmax,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
     /// Print PII locations and exit 1 if any are found.
     Check,
@@ -55,6 +63,9 @@ struct Cli {
     /// Use Metal (Apple GPU) instead of CPU. Off by default because some sandboxes can't init Metal.
     #[arg(long)]
     metal: bool,
+    /// Decoding strategy applied to per-token logits.
+    #[arg(long, value_enum, default_value_t = DecoderMode::Viterbi)]
+    decoder: DecoderMode,
 }
 
 fn main() -> ExitCode {
@@ -70,7 +81,7 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let device = pick_device(cli.metal)?;
-    let engine = Engine::load(&cli.model_dir, device)?;
+    let engine = Engine::load(&cli.model_dir, device, cli.decoder)?;
 
     match cli.mode {
         Mode::Stream => run_stream(&engine),
@@ -90,12 +101,13 @@ struct Engine {
     tokenizer: Tokenizer,
     model: Transformer,
     decoder: ViterbiDecoder,
+    decoder_mode: DecoderMode,
     label_info: LabelInfo,
     device: Device,
 }
 
 impl Engine {
-    fn load(model_dir: &std::path::Path, device: Device) -> Result<Self> {
+    fn load(model_dir: &std::path::Path, device: Device, decoder_mode: DecoderMode) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let tokenizer_path = model_dir.join("tokenizer.json");
         let weights_path = model_dir.join("model.safetensors");
@@ -110,6 +122,7 @@ impl Engine {
             tokenizer,
             model,
             decoder,
+            decoder_mode,
             label_info,
             device,
         })
@@ -136,7 +149,10 @@ impl Engine {
         let log_probs = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
         let log_probs_v: Vec<f32> = log_probs.flatten_all()?.to_vec1()?;
 
-        let label_path = self.decoder.decode(&log_probs_v, tokens_count);
+        let label_path = match self.decoder_mode {
+            DecoderMode::Viterbi => self.decoder.decode(&log_probs_v, tokens_count),
+            DecoderMode::Argmax => argmax_decode(&log_probs_v, tokens_count, self.label_info.num_classes()),
+        };
         let spans = extract_spans(&label_path, &offsets, text, &self.label_info);
         Ok(DetectionResult { spans, tokens: tokens_count })
     }
@@ -229,9 +245,11 @@ fn run_debug(engine: &Engine, text: &str) -> Result<ExitCode> {
     let logits = engine.model.forward(&tokens)?;
     let log_probs_t = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
     let log_probs_v: Vec<f32> = log_probs_t.flatten_all()?.to_vec1()?;
-    let label_path = engine.decoder.decode(&log_probs_v, token_ids.len());
-
     let n = engine.label_info.num_classes();
+    let label_path = match engine.decoder_mode {
+        DecoderMode::Viterbi => engine.decoder.decode(&log_probs_v, token_ids.len()),
+        DecoderMode::Argmax => argmax_decode(&log_probs_v, token_ids.len(), n),
+    };
     for (i, &tid) in token_ids.iter().enumerate() {
         let (bs, be) = offsets[i];
         let token_text = text.get(bs..be).unwrap_or("");
@@ -305,6 +323,23 @@ fn read_input(cli: &Cli) -> Result<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+fn argmax_decode(log_probs: &[f32], seq_len: usize, n: usize) -> Vec<usize> {
+    let mut path = Vec::with_capacity(seq_len);
+    for step in 0..seq_len {
+        let token_lp = &log_probs[step * n..(step + 1) * n];
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in token_lp.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i;
+            }
+        }
+        path.push(best);
+    }
+    path
 }
 
 fn pick_device(use_metal: bool) -> Result<Device> {

@@ -17,7 +17,12 @@ import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { pipeline, env, type TokenClassificationOutput } from "@huggingface/transformers";
+import {
+  AutoTokenizer,
+  pipeline,
+  env,
+  type PreTrainedTokenizer,
+} from "@huggingface/transformers";
 
 const HERE = dirname(import.meta.path);
 const PROJECT_ROOT = resolve(HERE, "..");
@@ -172,44 +177,87 @@ function trimWhitespace(text: string, start: number, end: number): [number, numb
   return [start, end];
 }
 
-// transformers.js token-classification doesn't emit start/end offsets, only `word`.
-// Locate each match by searching forward from the previous match's end. The Rust
-// side trims whitespace from spans, so we do too.
-function tjsToSpans(text: string, output: TokenClassificationOutput | TokenClassificationOutput[]): Span[] {
-  const arr = (Array.isArray(output[0]) ? output[0] : output) as Array<{
-    entity_group?: string;
-    entity?: string;
-    word: string;
-    start?: number;
-    end?: number;
-  }>;
-  const spans: Span[] = [];
+function splitBies(entity: string): { prefix: string; label: string } {
+  const i = entity.indexOf("-");
+  if (i < 0) return { prefix: "", label: entity };
+  return { prefix: entity.slice(0, i), label: entity.slice(i + 1) };
+}
+
+type RawTok = { entity: string; index: number; score: number; word: string };
+
+// transformers.js doesn't return offset_mapping for this tokenizer, so we
+// reconstruct per-token char offsets by decoding each token id back to its
+// substring and accumulating lengths. o200k_base BPE has no normalization,
+// so decode + concat is faithful to the original text.
+async function buildTokenOffsets(
+  text: string,
+  tokenizer: PreTrainedTokenizer,
+): Promise<Array<[number, number]>> {
+  const enc = (await tokenizer(text)) as { input_ids: { tolist: () => bigint[][] } };
+  const idsRow = enc.input_ids.tolist()[0] ?? [];
+  const offsets: Array<[number, number]> = [];
   let cursor = 0;
-  for (const e of arr) {
-    const label = e.entity_group ?? e.entity ?? "";
-    if (!label || label === "O") continue;
-    let charStart: number;
-    let charEnd: number;
-    if (e.start != null && e.end != null) {
-      charStart = e.start;
-      charEnd = e.end;
-    } else {
-      const word = e.word ?? "";
-      const idx = text.indexOf(word, cursor);
-      if (idx < 0) continue;
-      charStart = idx;
-      charEnd = idx + word.length;
-    }
-    cursor = charEnd;
-    [charStart, charEnd] = trimWhitespace(text, charStart, charEnd);
-    if (charStart >= charEnd) continue;
-    spans.push({
-      label,
-      byte_start: charToByte(text, charStart),
-      byte_end: charToByte(text, charEnd),
-      text: text.slice(charStart, charEnd),
-    });
+  for (const id of idsRow) {
+    const tokStr = tokenizer.decode([Number(id)]) as unknown as string;
+    const len = tokStr.length;
+    offsets.push([cursor, cursor + len]);
+    cursor += len;
   }
+  if (cursor !== text.length) {
+    process.stderr.write(
+      `[oracle] decode reconstruction length mismatch: ${cursor} vs ${text.length}\n`,
+    );
+  }
+  return offsets;
+}
+
+async function tjsToSpans(
+  text: string,
+  tokenizer: PreTrainedTokenizer,
+  raw: RawTok[],
+): Promise<Span[]> {
+  const flat = await buildTokenOffsets(text, tokenizer);
+
+  const spans: Span[] = [];
+  let cur: { label: string; startTok: number; endTok: number } | null = null;
+
+  const finalize = () => {
+    if (!cur) return;
+    const startPair = flat[cur.startTok];
+    const endPair = flat[cur.endTok];
+    if (!startPair || !endPair) {
+      cur = null;
+      return;
+    }
+    let [cs] = startPair;
+    let ce = endPair[1];
+    [cs, ce] = trimWhitespace(text, cs, ce);
+    if (cs < ce) {
+      spans.push({
+        label: cur.label,
+        byte_start: charToByte(text, cs),
+        byte_end: charToByte(text, ce),
+        text: text.slice(cs, ce),
+      });
+    }
+    cur = null;
+  };
+
+  for (const tok of raw) {
+    if (tok.entity === "O" || !tok.entity) {
+      finalize();
+      continue;
+    }
+    const { prefix, label } = splitBies(tok.entity);
+    const continues = cur && cur.label === label && (prefix === "I" || prefix === "E");
+    if (continues) {
+      cur!.endTok = tok.index;
+    } else {
+      finalize();
+      cur = { label, startTok: tok.index, endTok: tok.index };
+    }
+  }
+  finalize();
   return spans;
 }
 
@@ -260,6 +308,7 @@ type Args = {
   showDiffs: number;
   metal: boolean;
   maxBytes: number;
+  decoder: "viterbi" | "argmax";
 };
 
 function parseCli(): Args {
@@ -275,6 +324,7 @@ function parseCli(): Args {
       "show-diffs": { type: "string", default: "10" },
       "max-bytes": { type: "string", default: "8192" },
       metal: { type: "boolean", default: false },
+      decoder: { type: "string", default: "viterbi" },
       help: { type: "boolean", short: "h", default: false },
     },
     strict: true,
@@ -292,6 +342,7 @@ Options:
   --max-bytes <n>          Skip rows above this UTF-8 size (default 8192)
   --show-diffs <n>         Print up to this many mismatch examples (default 10)
   --metal                  Pass --metal to the Rust binary
+  --decoder <viterbi|argmax>  Rust decoder strategy (default viterbi)
   -h, --help
 `);
     process.exit(0);
@@ -306,6 +357,7 @@ Options:
     showDiffs: Number(values["show-diffs"]),
     metal: values.metal as boolean,
     maxBytes: Number(values["max-bytes"]),
+    decoder: (values.decoder === "argmax" ? "argmax" : "viterbi"),
   };
 }
 
@@ -331,6 +383,9 @@ async function main() {
     dtype: "fp32",
     local_files_only: true,
   } as Record<string, unknown>);
+  const tjsTokenizer = (await AutoTokenizer.from_pretrained(localId, {
+    local_files_only: true,
+  } as never)) as PreTrainedTokenizer;
 
   const rust = new StreamClient(
     [
@@ -338,10 +393,13 @@ async function main() {
       "stream",
       "-m",
       args.modelDir,
+      "--decoder",
+      args.decoder,
       ...(args.metal ? ["--metal"] : []),
     ],
     "rust",
   );
+  process.stderr.write(`rust decoder: ${args.decoder}\n`);
 
   const stats = {
     total: 0,
@@ -362,7 +420,7 @@ async function main() {
     const tjsStart = Date.now();
     const [rustReply, tjsRaw] = await Promise.all([
       rust.detect(req.id, req.text),
-      tjsPipe(req.text, { aggregation_strategy: "simple" } as Record<string, unknown>),
+      tjsPipe(req.text, { aggregation_strategy: "none" } as Record<string, unknown>),
     ]);
     stats.tjsMs += Date.now() - tjsStart;
     stats.total++;
@@ -372,7 +430,7 @@ async function main() {
       continue;
     }
     stats.rustUs += rustReply.elapsed_us ?? 0;
-    const oracleSpans = tjsToSpans(req.text, tjsRaw as TokenClassificationOutput);
+    const oracleSpans = await tjsToSpans(req.text, tjsTokenizer, tjsRaw as RawTok[]);
     const rustSpans = rustReply.spans ?? [];
     const cmp = compareSpans(rustSpans, oracleSpans);
     if (cmp.exact) {
