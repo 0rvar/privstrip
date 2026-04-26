@@ -1,6 +1,5 @@
+.DS_Store
 /target
-*.safetensors
-tokenizer.json
-/python-ref/.venv
-/python-ref/.direnv
-cloudwatch-pii-report.json
+models/*
+*report.json
+node_modules/

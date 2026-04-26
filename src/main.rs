@@ -50,7 +50,7 @@ struct Cli {
     #[arg(short = 't', long, conflicts_with = "file")]
     text: Option<String>,
     /// Directory containing model.safetensors, config.json, tokenizer.json.
-    #[arg(short = 'm', long, default_value = ".")]
+    #[arg(short = 'm', long, default_value = "models")]
     model_dir: PathBuf,
     /// Use Metal (Apple GPU) instead of CPU. Off by default because some sandboxes can't init Metal.
     #[arg(long)]
