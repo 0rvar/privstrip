@@ -3,3 +3,4 @@
 tokenizer.json
 /python-ref/.venv
 /python-ref/.direnv
+cloudwatch-pii-report.json

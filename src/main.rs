@@ -4,7 +4,7 @@ mod model;
 mod spans;
 mod viterbi;
 
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -30,6 +30,8 @@ enum Mode {
     List,
     /// Print per-token predictions for debugging.
     Debug,
+    /// Read JSON-lines (`{"id":..., "text":...}`) from stdin, emit matching `{"id":..., "spans":[...]}`.
+    Stream,
 }
 
 #[derive(Debug, Parser)]
@@ -50,9 +52,9 @@ struct Cli {
     /// Directory containing model.safetensors, config.json, tokenizer.json.
     #[arg(short = 'm', long, default_value = ".")]
     model_dir: PathBuf,
-    /// Force CPU even if Metal is available.
+    /// Use Metal (Apple GPU) instead of CPU. Off by default because some sandboxes can't init Metal.
     #[arg(long)]
-    cpu: bool,
+    metal: bool,
 }
 
 fn main() -> ExitCode {
@@ -67,74 +69,191 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    let device = pick_device(cli.metal)?;
+    let engine = Engine::load(&cli.model_dir, device)?;
 
-    let text = read_input(&cli)?;
-    if text.is_empty() {
-        // Empty input: nothing to detect; emit-and-exit per mode.
-        return emit_and_exit(cli.mode, &text, &[]);
+    match cli.mode {
+        Mode::Stream => run_stream(&engine),
+        Mode::Debug => {
+            let text = read_input(&cli)?;
+            run_debug(&engine, &text)
+        }
+        mode => {
+            let text = read_input(&cli)?;
+            let result = engine.detect(&text)?;
+            emit_and_exit(mode, &text, &result.spans)
+        }
+    }
+}
+
+struct Engine {
+    tokenizer: Tokenizer,
+    model: Transformer,
+    decoder: ViterbiDecoder,
+    label_info: LabelInfo,
+    device: Device,
+}
+
+impl Engine {
+    fn load(model_dir: &std::path::Path, device: Device) -> Result<Self> {
+        let config_path = model_dir.join("config.json");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let weights_path = model_dir.join("model.safetensors");
+
+        let config = ModelConfig::from_file(&config_path)?;
+        let label_info = LabelInfo::from_config(&config_path)?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+        let model = Transformer::load(&weights_path, config, device.clone())?;
+        let decoder = ViterbiDecoder::new(&label_info);
+        Ok(Self {
+            tokenizer,
+            model,
+            decoder,
+            label_info,
+            device,
+        })
     }
 
-    let device = pick_device(cli.cpu)?;
+    /// Tokenize, run the model, decode BIES with Viterbi, and extract final spans.
+    fn detect(&self, text: &str) -> Result<DetectionResult> {
+        if text.is_empty() {
+            return Ok(DetectionResult::default());
+        }
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let token_ids = encoding.get_ids().to_vec();
+        let offsets: Vec<(usize, usize)> = encoding.get_offsets().to_vec();
+        let tokens_count = token_ids.len();
+        if tokens_count == 0 {
+            return Ok(DetectionResult::default());
+        }
 
-    let config_path = cli.model_dir.join("config.json");
-    let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let weights_path = cli.model_dir.join("model.safetensors");
+        let tokens = Tensor::from_vec(token_ids.clone(), tokens_count, &self.device)?;
+        let logits = self.model.forward(&tokens)?;
+        let log_probs = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
+        let log_probs_v: Vec<f32> = log_probs.flatten_all()?.to_vec1()?;
 
-    let config = ModelConfig::from_file(&config_path)?;
-    let label_info = LabelInfo::from_config(&config_path)?;
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+        let label_path = self.decoder.decode(&log_probs_v, tokens_count);
+        let spans = extract_spans(&label_path, &offsets, text, &self.label_info);
+        Ok(DetectionResult { spans, tokens: tokens_count })
+    }
+}
 
-    let encoding = tokenizer
-        .encode(text.as_str(), false)
+#[derive(Default)]
+struct DetectionResult {
+    spans: Vec<DetectedSpan>,
+    tokens: usize,
+}
+
+fn run_stream(engine: &Engine) -> Result<ExitCode> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut reader = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let response = process_stream_line(engine, trimmed);
+        serde_json::to_writer(&mut out, &response)?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn process_stream_line(engine: &Engine, line: &str) -> serde_json::Value {
+    #[derive(serde::Deserialize)]
+    struct In {
+        id: serde_json::Value,
+        text: String,
+    }
+    let parsed: Result<In, _> = serde_json::from_str(line);
+    let (id, text) = match parsed {
+        Ok(v) => (v.id, v.text),
+        Err(e) => {
+            return serde_json::json!({
+                "id": null,
+                "error": format!("invalid input json: {e}"),
+            });
+        }
+    };
+    let started = std::time::Instant::now();
+    match engine.detect(&text) {
+        Ok(res) => {
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            serde_json::json!({
+                "id": id,
+                "spans": res.spans.iter().map(|s| serde_json::json!({
+                    "label": s.label,
+                    "byte_start": s.byte_start,
+                    "byte_end": s.byte_end,
+                    "text": s.text,
+                })).collect::<Vec<_>>(),
+                "tokens": res.tokens,
+                "elapsed_us": elapsed_us,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "id": id,
+            "error": format!("{e:#}"),
+        }),
+    }
+}
+
+fn run_debug(engine: &Engine, text: &str) -> Result<ExitCode> {
+    if text.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let encoding = engine
+        .tokenizer
+        .encode(text, false)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     let token_ids = encoding.get_ids().to_vec();
     let offsets: Vec<(usize, usize)> = encoding.get_offsets().to_vec();
-
     if token_ids.is_empty() {
-        return emit_and_exit(cli.mode, &text, &[]);
-    }
-
-    let model = Transformer::load(&weights_path, config, device.clone())?;
-
-    let tokens = Tensor::from_vec(token_ids.clone(), token_ids.len(), &device)?;
-    let logits = model.forward(&tokens)?; // [T, num_classes]
-    let log_probs = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
-    let log_probs_v: Vec<f32> = log_probs.flatten_all()?.to_vec1()?;
-
-    let decoder = ViterbiDecoder::new(&label_info);
-    let label_path = decoder.decode(&log_probs_v, token_ids.len());
-
-    if matches!(cli.mode, Mode::Debug) {
-        let n = label_info.num_classes();
-        for (i, &tid) in token_ids.iter().enumerate() {
-            let (bs, be) = offsets[i];
-            let token_text = text.get(bs..be).unwrap_or("");
-            let label_id = label_path[i];
-            // Top-3 raw probabilities for context.
-            let token_lp = &log_probs_v[i * n..(i + 1) * n];
-            let mut ranked: Vec<(usize, f32)> =
-                token_lp.iter().copied().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let argmax_id = ranked[0].0;
-            println!(
-                "{:>3} tok={:<7} bytes={}..{} text={:?} viterbi={}({}) argmax={}({:.2})",
-                i,
-                tid,
-                bs,
-                be,
-                token_text,
-                label_info.id2label[label_id],
-                label_id,
-                label_info.id2label[argmax_id],
-                ranked[0].1.exp(),
-            );
-        }
         return Ok(ExitCode::SUCCESS);
     }
 
-    let spans = extract_spans(&label_path, &offsets, &text, &label_info);
-    emit_and_exit(cli.mode, &text, &spans)
+    let tokens = Tensor::from_vec(token_ids.clone(), token_ids.len(), &engine.device)?;
+    let logits = engine.model.forward(&tokens)?;
+    let log_probs_t = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
+    let log_probs_v: Vec<f32> = log_probs_t.flatten_all()?.to_vec1()?;
+    let label_path = engine.decoder.decode(&log_probs_v, token_ids.len());
+
+    let n = engine.label_info.num_classes();
+    for (i, &tid) in token_ids.iter().enumerate() {
+        let (bs, be) = offsets[i];
+        let token_text = text.get(bs..be).unwrap_or("");
+        let label_id = label_path[i];
+        let token_lp = &log_probs_v[i * n..(i + 1) * n];
+        let mut ranked: Vec<(usize, f32)> = token_lp.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let argmax_id = ranked[0].0;
+        println!(
+            "{:>3} tok={:<7} bytes={}..{} text={:?} viterbi={}({}) argmax={}({:.2})",
+            i,
+            tid,
+            bs,
+            be,
+            token_text,
+            engine.label_info.id2label[label_id],
+            label_id,
+            engine.label_info.id2label[argmax_id],
+            ranked[0].1.exp(),
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn emit_and_exit(mode: Mode, text: &str, spans: &[DetectedSpan]) -> Result<ExitCode> {
@@ -157,7 +276,6 @@ fn emit_and_exit(mode: Mode, text: &str, spans: &[DetectedSpan]) -> Result<ExitC
             print!("{}", redact(text, spans));
             Ok(ExitCode::SUCCESS)
         }
-        Mode::Debug => unreachable!("debug handled above"),
         Mode::List => {
             let json: Vec<serde_json::Value> = spans
                 .iter()
@@ -173,6 +291,7 @@ fn emit_and_exit(mode: Mode, text: &str, spans: &[DetectedSpan]) -> Result<ExitC
             println!("{}", serde_json::to_string_pretty(&json)?);
             Ok(ExitCode::SUCCESS)
         }
+        Mode::Debug | Mode::Stream => unreachable!("handled above"),
     }
 }
 
@@ -188,12 +307,9 @@ fn read_input(cli: &Cli) -> Result<String> {
     Ok(buf)
 }
 
-fn pick_device(force_cpu: bool) -> Result<Device> {
-    if force_cpu {
-        return Ok(Device::Cpu);
-    }
-    if let Ok(d) = Device::new_metal(0) {
-        return Ok(d);
+fn pick_device(use_metal: bool) -> Result<Device> {
+    if use_metal {
+        return Ok(Device::new_metal(0)?);
     }
     Ok(Device::Cpu)
 }
