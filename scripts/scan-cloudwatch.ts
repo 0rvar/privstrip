@@ -71,6 +71,8 @@ type Args = {
   modelDir: string;
   metal: boolean;
   examplesPerGroup: number;
+  awsConcurrency: number;
+  queueDepth: number;
 };
 
 function parseCli(): Args {
@@ -93,6 +95,8 @@ function parseCli(): Args {
       "model-dir": { type: "string", default: PROJECT_ROOT },
       metal: { type: "boolean", default: false },
       "examples-per-group": { type: "string", default: "5" },
+      "aws-concurrency": { type: "string", default: "4" },
+      "queue-depth": { type: "string", default: "64" },
       help: { type: "boolean", short: "h", default: false },
     },
     strict: true,
@@ -116,6 +120,8 @@ Options:
   --privstrip-bin <path>      Path to the privstrip binary
   --model-dir <path>          Directory containing model.safetensors / config.json / tokenizer.json
   --metal                     Try to use the Apple Metal backend (default: CPU)
+  --aws-concurrency <n>       Parallel AWS log-event fetches (default 4)
+  --queue-depth <n>           Max events buffered between AWS fetches and inference (default 64)
   -h, --help                  Show this help
 `);
     process.exit(0);
@@ -135,6 +141,8 @@ Options:
     modelDir: values["model-dir"] as string,
     metal: values.metal as boolean,
     examplesPerGroup: Number(values["examples-per-group"]),
+    awsConcurrency: Number(values["aws-concurrency"]),
+    queueDepth: Number(values["queue-depth"]),
   };
 }
 
@@ -218,26 +226,25 @@ async function fetchEvents(args: Args, group: string): Promise<EventRow[]> {
 }
 
 type ProgressFrame = {
-  group: string;
-  groupIdx: number;
+  scanned: number;
+  withPii: number;
+  estimatedTotal: number;
+  groupsFetched: number;
   groupCount: number;
-  eventIdx: number;
-  eventCount: number;
-  groupDirty: number;
-  totalScanned: number;
-  totalWithPii: number;
+  queueDepth: number;
   startedAt: number;
 };
 
 class Progress {
   private isTty = Boolean(process.stderr.isTTY);
   private currentLineLen = 0;
+  private lastNonTtyLine = 0;
 
-  /** Render a transient progress frame on the current stderr line. */
   update(f: ProgressFrame): void {
     if (!this.isTty) {
-      // In non-TTY mode (CI, piped), emit one line every 10 events to avoid log spam.
-      if (f.eventIdx > 0 && f.eventIdx % 10 !== 0) return;
+      // Non-TTY: emit one line every 10 messages to avoid log spam.
+      if (f.scanned - this.lastNonTtyLine < 10 && f.scanned !== f.estimatedTotal) return;
+      this.lastNonTtyLine = f.scanned;
       process.stderr.write(this.format(f) + "\n");
       return;
     }
@@ -247,7 +254,6 @@ class Progress {
     this.currentLineLen = line.length;
   }
 
-  /** Print a permanent line above the progress indicator (e.g. group summaries, errors). */
   note(line: string): void {
     if (!this.isTty) {
       process.stderr.write(line + "\n");
@@ -265,28 +271,25 @@ class Progress {
 
   private format(f: ProgressFrame): string {
     const elapsedMs = Date.now() - f.startedAt;
-    const done = f.totalScanned;
-    const remainingEstimate = estimateRemaining(f);
-    const etaMs = done > 0 ? (elapsedMs / done) * remainingEstimate : 0;
-    const elapsed = formatDuration(elapsedMs);
-    const eta = etaMs > 0 ? formatDuration(etaMs) : "--:--";
-    const groupCol = truncate(f.group, 40);
+    const elapsedSec = elapsedMs / 1000;
+    const rate = elapsedSec > 0 ? f.scanned / elapsedSec : 0;
+    const remaining = Math.max(0, f.estimatedTotal - f.scanned);
+    const etaSec = rate > 0 ? remaining / rate : 0;
+    const pct = f.estimatedTotal > 0 ? Math.floor((f.scanned / f.estimatedTotal) * 100) : 0;
     return (
-      `[${pad(f.groupIdx, 4)}/${pad(f.groupCount, 4)}]` +
-      ` ${groupCol.padEnd(40)}` +
-      ` ev ${pad(f.eventIdx + 1, 3)}/${pad(f.eventCount, 3)}` +
-      ` dirty ${pad(f.groupDirty, 3)}` +
-      ` total ${pad(f.totalWithPii, 4)}/${pad(f.totalScanned, 5)}` +
-      ` elapsed ${elapsed} eta ${eta}`
+      `${pad(f.scanned, 5)}/${pad(f.estimatedTotal, 5)} (${pad(pct, 2)}%)` +
+      ` groups ${pad(f.groupsFetched, 3)}/${pad(f.groupCount, 3)}` +
+      ` queue ${pad(f.queueDepth, 3)}` +
+      ` pii ${pad(f.withPii, 4)}` +
+      ` ${rate.toFixed(1).padStart(5)} msg/s` +
+      ` elapsed ${formatDuration(elapsedMs)}` +
+      ` eta ${etaSec > 0 ? formatDuration(etaSec * 1000) : "--:--"}`
     );
   }
 }
 
-function estimateRemaining(f: ProgressFrame): number {
-  // Best-effort: assume future groups have the same per-group event count as the current group.
-  const remainingInGroup = Math.max(0, f.eventCount - (f.eventIdx + 1));
-  const remainingGroups = f.groupCount - f.groupIdx;
-  return remainingInGroup + remainingGroups * f.eventCount;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatDuration(ms: number): string {
@@ -300,11 +303,6 @@ function formatDuration(ms: number): string {
 
 function pad(n: number, width: number): string {
   return String(n).padStart(width, "0");
-}
-
-function truncate(s: string, width: number): string {
-  if (s.length <= width) return s;
-  return s.slice(0, width - 1) + "…";
 }
 
 function placeholderFor(label: string): string {
@@ -402,77 +400,122 @@ async function main() {
   const progress = new Progress();
   progress.note("listing log groups...");
   const groups = await listLogGroups(args);
-  progress.note(`scanning ${groups.length} groups (region=${args.region ?? "default"})`);
+  progress.note(
+    `scanning ${groups.length} groups (region=${args.region ?? "default"}, ` +
+      `aws-concurrency=${args.awsConcurrency}, queue-depth=${args.queueDepth})`,
+  );
 
   const client = new StreamClient(args);
   const findings: Record<string, GroupFinding> = {};
+  for (const g of groups) {
+    findings[g] = {
+      events_scanned: 0,
+      events_with_pii: 0,
+      label_counts: {},
+      examples: [],
+    };
+  }
+
+  type QueueItem = { group: string; eventIdx: number; ev: EventRow };
+  const queue: QueueItem[] = [];
+  let producerDone = false;
 
   let totalScanned = 0;
   let totalWithPii = 0;
   let totalTokens = 0;
   let totalInferenceUs = 0;
+  let groupsFetched = 0;
   const startedAt = Date.now();
-  let groupIdx = 0;
-  for (const group of groups) {
-    groupIdx += 1;
+
+  const renderProgress = () => {
+    // Estimate the remaining workload: groups fetched have known event counts;
+    // unfetched groups conservatively assume the full per-group sample size.
+    const knownEvents = Object.values(findings).reduce((acc, f) => acc + f.events_scanned, 0);
+    const projected =
+      knownEvents + (groups.length - groupsFetched) * args.perGroup;
+    progress.update({
+      scanned: totalScanned,
+      withPii: totalWithPii,
+      estimatedTotal: Math.max(projected, totalScanned),
+      groupsFetched,
+      groupCount: groups.length,
+      queueDepth: queue.length,
+      startedAt,
+    });
+  };
+
+  const fetchAndEnqueue = async (group: string) => {
     const events = await fetchEvents(args, group);
-    const finding: GroupFinding = {
-      events_scanned: events.length,
-      events_with_pii: 0,
-      label_counts: {},
-      examples: [],
-    };
+    findings[group].events_scanned = events.length;
+    groupsFetched += 1;
+    for (let j = 0; j < events.length; j++) {
+      // Backpressure: stop pushing while the queue is full.
+      while (queue.length >= args.queueDepth) await sleep(5);
+      queue.push({ group, eventIdx: j, ev: events[j] });
+    }
+  };
 
-    for (let i = 0; i < events.length; i++) {
-      const ev = events[i];
-      progress.update({
-        group,
-        groupIdx,
-        groupCount: groups.length,
-        eventIdx: i,
-        eventCount: events.length,
-        groupDirty: finding.events_with_pii,
-        totalScanned,
-        totalWithPii,
-        startedAt,
-      });
+  const producer = async () => {
+    let nextIdx = 0;
+    const workers = Array.from({ length: args.awsConcurrency }, async () => {
+      while (true) {
+        const i = nextIdx++;
+        if (i >= groups.length) return;
+        try {
+          await fetchAndEnqueue(groups[i]);
+        } catch (e) {
+          progress.note(`  ! ${groups[i]} fetch failed: ${(e as Error).message}`);
+          groupsFetched += 1;
+        }
+      }
+    });
+    await Promise.all(workers);
+    producerDone = true;
+  };
 
-      const id = `${groupIdx}:${i}`;
-      const reply = await client.detect(id, ev.message);
+  const consumer = async () => {
+    while (!producerDone || queue.length > 0) {
+      if (queue.length === 0) {
+        await sleep(5);
+        continue;
+      }
+      const item = queue.shift()!;
+      const id = `${item.group}#${item.eventIdx}`;
+      const reply = await client.detect(id, item.ev.message);
       totalScanned += 1;
       totalTokens += reply.tokens ?? 0;
       totalInferenceUs += reply.elapsed_us ?? 0;
+      renderProgress();
+
       if (reply.error) {
-        progress.note(`  ! ${group} #${i}: ${reply.error}`);
+        progress.note(`  ! ${item.group} #${item.eventIdx}: ${reply.error}`);
         continue;
       }
       const spans = reply.spans ?? [];
       if (spans.length === 0) continue;
-      finding.events_with_pii += 1;
+      const f = findings[item.group];
+      f.events_with_pii += 1;
       totalWithPii += 1;
       for (const s of spans) {
-        finding.label_counts[s.label] = (finding.label_counts[s.label] ?? 0) + 1;
+        f.label_counts[s.label] = (f.label_counts[s.label] ?? 0) + 1;
       }
-      if (finding.examples.length < args.examplesPerGroup) {
-        finding.examples.push({
-          log_stream: ev.logStreamName,
-          timestamp: ev.timestamp,
+      if (f.examples.length < args.examplesPerGroup) {
+        f.examples.push({
+          log_stream: item.ev.logStreamName,
+          timestamp: item.ev.timestamp,
           spans: spans.map((s) => ({
             label: s.label,
             byte_start: s.byte_start,
             byte_end: s.byte_end,
             ...(args.includeText ? { text: s.text } : {}),
           })),
-          redacted_message: redactMessage(ev.message, spans),
+          redacted_message: redactMessage(item.ev.message, spans),
         });
       }
     }
+  };
 
-    findings[group] = finding;
-    progress.note(
-      `  [${groupIdx}/${groups.length}] ${group}: ${finding.events_with_pii}/${events.length} events with PII`,
-    );
-  }
+  await Promise.all([producer(), consumer()]);
 
   progress.clear();
   await client.close();
