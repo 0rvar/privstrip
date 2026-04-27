@@ -1,7 +1,7 @@
 [project]
 name = "privstrip-pyref"
 version = "0.1.0"
-description = "Python reference wrapper around openai/privacy-filter (opf) for three-way validation."
+description = "Python reference wrapper around openai/privacy-filter (opf), invoked by scripts/validate.ts as oracle C."
 requires-python = ">=3.11,<3.13"
 dependencies = [
   # Pinned to the exact commit of openai/privacy-filter we read while writing the wrapper.

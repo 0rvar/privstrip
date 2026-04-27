@@ -22,12 +22,15 @@ fidelity — useful as a sanity check, but not authoritative.
 nix develop                                         # uv + python311 + cargo + bun
 cd python-ref && uv sync && cd ..                   # one-time (downloads torch CPU + opf@main)
 cargo build --release
-bun scripts/three-way-validate.ts \
-  --max-rows 500 --matrix-out validation-matrix.json
+bun scripts/validate.ts --max-rows 500 --js \
+  --matrix-out validation-matrix.json
 ```
 
-The Python leg caches its outputs in `scripts/.python-cache.jsonl`; pass
-`--no-python` to reuse the cache after the first run.
+The Python leg caches its outputs in `scripts/.python-cache.jsonl`. The default
+is to read from the cache and auto-populate any missing rows; pass
+`--no-python` to skip cache misses instead, or `--refresh-python` to clear and
+re-run. Drop `--js` to skip the transformers.js oracle — the two-pair
+Rust-vs-Python matrix is what most correctness work needs.
 
 ## Three-way agreement matrix (500 rows)
 
@@ -185,7 +188,7 @@ Cluster D above. They are concentrated on borderline tokens (top-2 within
 Rust does. Two structural causes show up in the diff:
 
 - The reconstructed character-offset map in
-  [scripts/three-way-validate.ts::buildTokenOffsets](scripts/three-way-validate.ts)
+  [scripts/validate.ts::buildTokenOffsets](scripts/validate.ts)
   is built by iteratively decoding each token id and accumulating
   `tokStr.length`. For most corpus rows this matches the original text
   exactly, but a handful of rows trigger the

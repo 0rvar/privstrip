@@ -2,8 +2,8 @@
 
 Reference implementation wrapper around the official
 [openai/privacy-filter](https://github.com/openai/privacy-filter) (`opf`) Python
-package. Used as the third leg of the three-way validation matrix described in
-`../VALIDATION.md`.
+package. Used as the Python leg (oracle C) of the validation matrix described
+in `../VALIDATION.md`.
 
 The HF checkpoint and the `opf` GitHub package were uploaded a few days apart
 with mismatched config schemas (different field names, missing keys). This

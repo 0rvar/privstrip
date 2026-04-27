@@ -27,12 +27,16 @@ The model recognizes 8 entity types (`account_number`, `private_address`, `priva
   - `model.safetensors` (~2.8 GB bf16) — the weights we actually use
   - `tokenizer.json`, `tokenizer_config.json` — o200k_base BPE
   - `config.json` — architecture hyperparameters and `id2label`
-  - `viterbi_calibration.json` — unused at runtime; kept for reference
+  - `viterbi_calibration.json` — Viterbi transition biases. Auto-loaded at startup; the shipped `default` operating point has all-zero biases (a no-op vs constraint-only decoding). Override with `--operating-point <name>`.
   - `onnx/` — ONNX export from upstream (kept for the validation oracle to load via transformers.js, see below). Candle cannot run the ONNX (see "What didn't work")
+- `python-ref/` — Python reference (oracle C). Standalone uv project that wraps the official `opf` package and exposes the same JSONL stream protocol as `privstrip stream`. See `python-ref/README.md`.
+- `flake.nix` — dev shell providing cargo + rustc + uv + python311 + bun.
 - `scripts/`
-  - `validate.ts` — bun script: spawns the Rust binary in `stream` mode and runs transformers.js in-process on a corpus of HF rows; reports exact-match rate + per-label disagreement
-  - `corpus.jsonl` — 500 English rows from `ai4privacy/pii-masking-300k`, fetched on demand by `validate.ts`
-  - `smoke-stream.ts` — minimal end-to-end smoke test of the stream protocol
+  - `validate.ts` — primary harness. Spawns Rust (argmax + viterbi) and `python-ref/run_reference.py` (argmax + viterbi); compares spans pairwise. Reads Python results from `scripts/.python-cache.jsonl` and auto-populates any missing rows (pass `--no-python` to skip them instead, `--refresh-python` to clear the cache and re-run all). Pass `--js` to also load the transformers.js oracle and emit the full 6-pair matrix.
+  - `corpus.jsonl` — 500 English rows from `ai4privacy/pii-masking-300k`, fetched on demand by `validate.ts`.
+  - `smoke-stream.ts` — minimal end-to-end smoke test of the stream protocol.
+- `VALIDATION.md` — agreement matrix, residual analysis (bf16/f32 drift), and which fixes landed.
+- `BENCHMARKS.md` — per-row latency for Rust (CPU + Metal) and Python on the corpus.
 
 ## Architecture cheat-sheet
 
@@ -63,27 +67,40 @@ echo '{"id":1,"text":"Call John at 555-1234"}' | target/release/privstrip stream
 target/release/privstrip --metal check -f input.txt -m models
 ```
 
-The default `--model-dir` is `models`. The default decoder is `viterbi`; `--decoder argmax` matches transformers.js's per-token-argmax pipeline (see "Decoder choice" below).
+The default `--model-dir` is `models`. The default decoder is `viterbi`; `--decoder argmax` matches transformers.js's per-token-argmax pipeline (see "Decoder choice" below). `--operating-point <name>` selects a Viterbi calibration; the shipped default is `default` (all-zero biases).
 
 ## Validation
 
-`scripts/validate.ts` is the test harness. There are no Rust unit tests — the validation script is higher-fidelity than anything we'd write inline.
+There are no Rust unit tests — the validation harness is higher-fidelity than anything we'd write inline. See `VALIDATION.md` for the full matrix and residual analysis.
+
+The reference is **C = the Python `opf` package** running the same `model.safetensors` weights. **B = transformers.js** is a secondary oracle of unknown fidelity (different ONNX export, slightly different post-processing). **A = this Rust port** is the system under test.
 
 ```fish
-# fetch corpus on first run, then validate against transformers.js
-bun scripts/validate.ts \
-  --decoder argmax \
-  --privstrip-bin target/release/privstrip \
-  --model-dir models
+nix develop                                         # uv + python311 + cargo + bun
+cd python-ref && uv sync && cd ..                   # one-time (downloads torch CPU + opf@main)
+cargo build --release
+
+# default: read python from cache, auto-populate any missing rows, no JS
+bun scripts/validate.ts --max-rows 500 --matrix-out validation-matrix.json
+
+# skip rows missing from the cache instead of running python (no uv/torch)
+bun scripts/validate.ts --max-rows 500 --no-python
+
+# clear the cache and re-run every row through python
+bun scripts/validate.ts --max-rows 500 --refresh-python
+
+# full 6-pair matrix including transformers.js oracle
+bun scripts/validate.ts --max-rows 500 --js
 ```
 
-Current baselines on the 500-row corpus:
-- `--decoder argmax`: 95.60% exact-match against transformers.js
-- `--decoder viterbi`: 93.20% exact-match
+Current baselines on the 500-row corpus (A vs C is the load-bearing comparison):
+- `A_viterbi_vs_C_viterbi`: **99.00%** (5 mismatched rows)
+- `A_argmax_vs_C_argmax`: **96.80%** (16 mismatched rows)
+- `A_viterbi_vs_B`: 93.20% (transformers.js doesn't run our Viterbi — comparing argmax-style spans to Viterbi spans surfaces structural differences, not bugs)
 
-The remaining gap is **not** forward-pass drift — it's span aggregation rules differing between our `extract_spans` and transformers.js's `aggregation_strategy: "simple"` post-processing. Forward-pass parity with the official ONNX export is essentially confirmed by the argmax run.
+All 21 A↔C mismatches are bf16/f32 precision-tie flips, not algorithmic divergence — `opf` runs most of the attention path at bf16 and we run everything at f32 for op coverage. See `VALIDATION.md` Cluster D for traces.
 
-The validation script reconstructs token char offsets via `tokenizer.decode([id])` accumulation because transformers.js's `pipeline("token-classification")` does not return `start`/`end`, and its tokenizer also does not return `offset_mapping`. BPE is reversible, so accumulated decode-lengths give us byte offsets.
+When `--js` is enabled, `validate.ts` reconstructs token char offsets via `tokenizer.decode([id])` accumulation because transformers.js's `pipeline("token-classification")` does not return `start`/`end`. BPE is reversible, so accumulated decode-lengths give us byte offsets.
 
 ## Decoder choice
 
@@ -95,8 +112,10 @@ Validation runs both modes to catch regressions in either path.
 ## What didn't work (and why this matters for future changes)
 
 - **candle-onnx (0.10.x) cannot run the upstream ONNX export.** It's missing `TopK`, `ScatterND`, `GatherND`, `Loop`, and `LayerNormalization`. We load `model.safetensors` directly into hand-written candle ops instead. Don't try to switch to ONNX without first checking whether candle has gained those ops.
-- **The official Python `opf` package drifted incompatible with this checkpoint.** The HF model file we use was published 4–5 days apart from a github release that no longer loads it (different tokenizer expectations, etc.). The transformers.js path is the only known-working oracle for now.
+- **The official Python `opf` package's HF config differs from the checkpoint's `config.json`.** OPF expects a flat schema (`num_experts`, `bidirectional_context`, flattened `rope_*` keys) while the HF file uses `num_local_experts`, nested `rope_parameters`, etc. `python-ref/run_reference.py::build_opf_config` translates between them and writes a side-car checkpoint dir with the patched config + a symlink to the original `model.safetensors`. If `opf` upstream changes its config schema, that translator is the thing to update.
 - **Long inputs:** `build_yarn_rope` caps the precomputed RoPE table at 8192 positions. `Transformer::forward` rejects inputs longer than that with a clear error. To support longer inputs, raise the cap there — the model's `max_position_embeddings` is 131072 so the architecture itself supports more.
+- **Closing the bf16/f32 precision gap on A↔C** would require casting Q/K/V and the attention output back to bf16 between RoPE and the einsums, mirroring `opf`'s `sdpa`. Candle 0.10.x bf16 op coverage on CPU is not complete, and matching the recipe would tightly couple the forward pass to the reference. We accept the residual; see `VALIDATION.md` Cluster D.
+- **Metal is only ~6–13% faster than CPU on the corpus.** The MoE expert dispatch needs CPU-side top-k routing, forcing a device→host sync 8 times per forward. With ~100-token median rows, per-kernel GPU launch overhead also eats the gain. First Metal call is ~10–13 s (kernel compilation + RoPE table upload). Larger inputs would amortize this better, but we have not benchmarked them.
 
 ## Performance notes
 
@@ -114,4 +133,4 @@ What's deliberately not optimized yet:
 - The on-disk model dtype is bf16; we always convert to f32 for the forward pass. Don't change `dtype` in `Transformer::load` without checking that every op supports the new dtype on every device.
 - All span byte offsets are in the input text's bytes, not chars. The tokenizer's offset map is byte-indexed.
 - `LabelInfo::from_config` parses BIES prefixes from the label string (`"B-private_phone"` → `Boundary::B`, span label `"private_phone"`). The model file is the source of truth for the label set.
-- `extract_spans` does whitespace-trim → per-label dedup (keep longest) → greedy non-overlapping select across labels. Changing this order changes the output and will move the validation match rate.
+- `extract_spans` does whitespace-trim → per-label dedup (keep longest) → greedy non-overlapping select across labels. Changing this order changes the output and will move the validation match rate. Two OPF-parity rules to preserve: (1) a background (`O`) token closes any open span at its left edge — see `labels_to_token_spans` in `src/spans.rs`; (2) `select_non_overlapping` sorts by `(start, -length, label)` so when two spans share a start the longer one wins, then alphabetical by label.

@@ -49,7 +49,7 @@ read these numbers as "torch is slow."
 ## Methodology
 
 ```fish
-bun scripts/three-way-validate.ts --max-rows 500
+bun scripts/validate.ts --max-rows 500 --js
 ```
 
 Per-row latency is the difference between the JSONL request being
