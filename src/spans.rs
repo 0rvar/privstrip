@@ -166,13 +166,21 @@ pub fn trim_whitespace(
 pub fn discard_overlapping_per_label(
     spans: Vec<(String, usize, usize)>,
 ) -> Vec<(String, usize, usize)> {
-    use std::collections::HashMap;
-    let mut by_label: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut buckets: Vec<Vec<(usize, usize)>> = Vec::new();
     for (label, s, e) in spans {
-        by_label.entry(label).or_default().push((s, e));
+        let idx = match labels.iter().position(|l| l == &label) {
+            Some(i) => i,
+            None => {
+                labels.push(label);
+                buckets.push(Vec::new());
+                labels.len() - 1
+            }
+        };
+        buckets[idx].push((s, e));
     }
     let mut kept: Vec<(String, usize, usize)> = Vec::new();
-    for (label, mut list) in by_label {
+    for (label, mut list) in labels.into_iter().zip(buckets.into_iter()) {
         // Sort by start asc, then by length desc.
         list.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         let mut last_end: usize = 0;

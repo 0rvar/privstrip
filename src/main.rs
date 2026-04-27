@@ -256,7 +256,9 @@ fn run_debug(engine: &Engine, text: &str) -> Result<ExitCode> {
         let label_id = label_path[i];
         let token_lp = &log_probs_v[i * n..(i + 1) * n];
         let mut ranked: Vec<(usize, f32)> = token_lp.iter().copied().enumerate().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let argmax_id = ranked[0].0;
         println!(
             "{:>3} tok={:<7} bytes={}..{} text={:?} viterbi={}({}) argmax={}({:.2})",

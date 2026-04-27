@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use anyhow::{Context, Result};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
@@ -9,6 +11,7 @@ pub struct Transformer {
     pub blocks: Vec<TransformerBlock>,
     pub final_norm: RmsNorm,
     pub unembedding: Tensor,
+    pub sliding_window: usize,
 }
 
 pub struct TransformerBlock {
@@ -24,7 +27,6 @@ pub struct AttentionBlock {
     pub num_q_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-    pub sliding_window: usize,
     pub rope_cos: Tensor, // [max_pos, head_dim/2]
     pub rope_sin: Tensor,
 }
@@ -63,6 +65,7 @@ impl Transformer {
         let (rope_cos, rope_sin) = build_yarn_rope(&config, &device, dtype)?;
 
         let mut blocks = Vec::with_capacity(config.num_hidden_layers);
+        let sliding_window = config.sliding_window;
         for i in 0..config.num_hidden_layers {
             let block_vb = vb.pp(format!("block.{i}"));
             let attn = AttentionBlock::load(
@@ -80,19 +83,37 @@ impl Transformer {
             blocks,
             final_norm,
             unembedding,
+            sliding_window,
         })
     }
 
     /// Forward pass. `tokens` is a 1-D u32 Tensor of length T. Returns logits [T, num_classes] in f32.
     pub fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
+        let t = tokens.dim(0)?;
+        let max_pos = self.rope_cos_dim0()?;
+        anyhow::ensure!(
+            t <= max_pos,
+            "input is {t} tokens but RoPE table is sized for {max_pos}; \
+             raise the cap in build_yarn_rope or chunk the input"
+        );
+
+        let device = tokens.device().clone();
+        let dtype = self.embedding.dtype();
+        let mask = bidirectional_sliding_mask(t, self.sliding_window, &device, dtype)?;
+
         let mut x = self.embedding.index_select(tokens, 0)?; // [T, hidden]
         for block in &self.blocks {
-            x = block.attn.forward(&x)?;
+            x = block.attn.forward(&x, &mask)?;
             x = block.mlp.forward(&x)?;
         }
         let x = self.final_norm.forward(&x)?;
         let logits = x.matmul(&self.unembedding.t()?.contiguous()?)?; // [T, num_classes]
         Ok(logits)
+    }
+
+    fn rope_cos_dim0(&self) -> Result<usize> {
+        // The RoPE table lives on each AttentionBlock; they're all the same length.
+        Ok(self.blocks[0].attn.rope_cos.dim(0)?)
     }
 }
 
@@ -130,15 +151,13 @@ impl AttentionBlock {
             num_q_heads: nq,
             num_kv_heads: nkv,
             head_dim: d,
-            sliding_window: config.sliding_window,
             rope_cos,
             rope_sin,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let t = x.dim(0)?;
-        let device = x.device();
         let dtype = x.dtype();
 
         let normed = self.norm.forward(x)?;
@@ -192,8 +211,7 @@ impl AttentionBlock {
         let kt = k.transpose(1, 2)?.contiguous()?;
         let mut scores = q.matmul(&kt)?;
 
-        // Bidirectional sliding-window mask (this checkpoint is bidirectional with half-width 128).
-        let mask = bidirectional_sliding_mask(t, self.sliding_window, device, dtype)?; // [T, T]
+        // Bidirectional sliding-window mask is shared across blocks — built once per forward.
         scores = scores.broadcast_add(&mask.unsqueeze(0)?)?; // [nq, T, T]
 
         // Attention sinks: append one virtual key per head with logit = sink * ln(2).
@@ -275,24 +293,39 @@ impl MLPBlock {
             }
         }
 
-        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); self.num_experts];
-        for token in 0..t {
-            for j in 0..k {
-                let e = indices_flat[token * k + j] as usize;
-                per_expert[e].push((token as u32, weights_flat[token * k + j]));
-            }
+        // Build a single dispatch tensor per layer rather than one per expert.
+        // sort_by_key is stable, so within each expert's bucket tokens stay in
+        // ascending index order (matches the prior per_expert push order).
+        let total = t * k;
+        let mut order: Vec<usize> = (0..total).collect();
+        order.sort_by_key(|&i| indices_flat[i]);
+
+        let mut sorted_token_idx: Vec<u32> = Vec::with_capacity(total);
+        let mut sorted_weights: Vec<f32> = Vec::with_capacity(total);
+        let mut bucket_offsets: Vec<usize> = vec![0usize; self.num_experts + 1];
+        for &i in &order {
+            sorted_token_idx.push((i / k) as u32);
+            sorted_weights.push(weights_flat[i]);
+            bucket_offsets[indices_flat[i] as usize + 1] += 1;
+        }
+        for e in 0..self.num_experts {
+            bucket_offsets[e + 1] += bucket_offsets[e];
         }
 
+        // Two host->device transfers for dispatch metadata per layer instead of
+        // ~2 * num_active_experts. narrow() below is metadata-only.
+        let token_idx_t = Tensor::from_vec(sorted_token_idx, total, device)?;
+        let weights_t = Tensor::from_vec(sorted_weights, (total, 1), device)?.to_dtype(dtype)?;
+
         let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for (e, assigns) in per_expert.iter().enumerate() {
-            if assigns.is_empty() {
+        for e in 0..self.num_experts {
+            let start = bucket_offsets[e];
+            let n_e = bucket_offsets[e + 1] - start;
+            if n_e == 0 {
                 continue;
             }
-            let n_e = assigns.len();
-            let token_idx_v: Vec<u32> = assigns.iter().map(|(tok, _)| *tok).collect();
-            let weights_v: Vec<f32> = assigns.iter().map(|(_, w)| *w).collect();
-            let token_idx = Tensor::from_vec(token_idx_v, n_e, device)?;
-            let weights_col = Tensor::from_vec(weights_v, (n_e, 1), device)?.to_dtype(dtype)?;
+            let token_idx = token_idx_t.narrow(0, start, n_e)?;
+            let weights_col = weights_t.narrow(0, start, n_e)?;
 
             let x_e = normed.index_select(&token_idx, 0)?; // [n_e, hidden]
 
@@ -316,10 +349,12 @@ impl MLPBlock {
 fn top_k(values: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
     let mut paired: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();
     if k < paired.len() {
-        paired.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        paired.select_nth_unstable_by(k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+        });
         paired.truncate(k);
     }
-    paired.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    paired.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     let idx = paired.iter().map(|(i, _)| *i).collect();
     let val = paired.iter().map(|(_, v)| *v).collect();
     (idx, val)
