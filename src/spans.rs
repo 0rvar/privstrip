@@ -32,13 +32,10 @@ pub fn labels_to_token_spans(
             start_idx = None;
         }
 
+        // Background ("O") is the only label whose span_label is None in our
+        // LabelInfo. Match the OPF reference: a background token closes any
+        // open span at the current token's left edge.
         if span_label.is_none() {
-            previous_idx = Some(token_idx);
-            continue;
-        }
-
-        let is_background = matches!(boundary, Boundary::Background);
-        if is_background {
             if let (Some(cl), Some(s)) = (current_label.as_ref(), start_idx) {
                 spans.push((cl.clone(), s, token_idx));
             }
@@ -47,6 +44,7 @@ pub fn labels_to_token_spans(
             previous_idx = Some(token_idx);
             continue;
         }
+        debug_assert!(!matches!(boundary, Boundary::Background));
 
         let span_label = span_label.unwrap();
         match boundary {
@@ -198,11 +196,20 @@ pub fn discard_overlapping_per_label(
 }
 
 /// Greedily keep non-overlapping spans across all labels (left to right).
+///
+/// Tie-breaking matches OPF's `_select_non_overlapping_spans`: when two spans
+/// share a start offset, prefer the longer one; further ties broken by label
+/// name ascending. Same end offset, longer first wins by extending the cursor
+/// further.
 pub fn select_non_overlapping(
     spans: Vec<(String, usize, usize)>,
 ) -> Vec<(String, usize, usize)> {
     let mut sorted = spans;
-    sorted.sort_by_key(|(_, s, _)| *s);
+    sorted.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| (b.2 - b.1).cmp(&(a.2 - a.1)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let mut out: Vec<(String, usize, usize)> = Vec::new();
     let mut last_end: usize = 0;
     let mut started = false;

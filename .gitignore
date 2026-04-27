@@ -4,3 +4,12 @@ models/*
 *report.json
 node_modules/
 .claude/scheduled_tasks.lock
+
+# python-ref
+python-ref/.venv/
+python-ref/.opf-checkpoint/
+python-ref/__pycache__/
+python-ref/.python-version
+
+# three-way-validate cache (large)
+scripts/.python-cache.jsonl

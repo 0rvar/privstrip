@@ -18,7 +18,7 @@ use crate::config::ModelConfig;
 use crate::labels::LabelInfo;
 use crate::model::Transformer;
 use crate::spans::{DetectedSpan, extract_spans, redact};
-use crate::viterbi::ViterbiDecoder;
+use crate::viterbi::{ViterbiBiases, ViterbiDecoder};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DecoderMode {
@@ -66,6 +66,11 @@ struct Cli {
     /// Decoding strategy applied to per-token logits.
     #[arg(long, value_enum, default_value_t = DecoderMode::Viterbi)]
     decoder: DecoderMode,
+    /// Named operating point in `viterbi_calibration.json`. Only consulted in
+    /// viterbi mode. The shipped checkpoint has all-zero biases at the default
+    /// operating point, so the default is mathematically a no-op.
+    #[arg(long, default_value = "default")]
+    operating_point: String,
 }
 
 fn main() -> ExitCode {
@@ -81,7 +86,7 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let device = pick_device(cli.metal)?;
-    let engine = Engine::load(&cli.model_dir, device, cli.decoder)?;
+    let engine = Engine::load(&cli.model_dir, device, cli.decoder, &cli.operating_point)?;
 
     match cli.mode {
         Mode::Stream => run_stream(&engine),
@@ -107,17 +112,32 @@ struct Engine {
 }
 
 impl Engine {
-    fn load(model_dir: &std::path::Path, device: Device, decoder_mode: DecoderMode) -> Result<Self> {
+    fn load(
+        model_dir: &std::path::Path,
+        device: Device,
+        decoder_mode: DecoderMode,
+        operating_point: &str,
+    ) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let tokenizer_path = model_dir.join("tokenizer.json");
         let weights_path = model_dir.join("model.safetensors");
+        let calibration_path = model_dir.join("viterbi_calibration.json");
 
         let config = ModelConfig::from_file(&config_path)?;
         let label_info = LabelInfo::from_config(&config_path)?;
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
         let model = Transformer::load(&weights_path, config, device.clone())?;
-        let decoder = ViterbiDecoder::new(&label_info);
+
+        // Mirror opf's discover_default_viterbi_calibration_path: if the file is
+        // present in the model dir, load the named operating point. If absent,
+        // fall through to the all-zero default.
+        let biases = if calibration_path.exists() {
+            ViterbiBiases::from_calibration_file(&calibration_path, operating_point)?
+        } else {
+            ViterbiBiases::default()
+        };
+        let decoder = ViterbiDecoder::with_biases(&label_info, biases);
         Ok(Self {
             tokenizer,
             model,
@@ -250,6 +270,10 @@ fn run_debug(engine: &Engine, text: &str) -> Result<ExitCode> {
         DecoderMode::Viterbi => engine.decoder.decode(&log_probs_v, token_ids.len()),
         DecoderMode::Argmax => argmax_decode(&log_probs_v, token_ids.len(), n),
     };
+    let dump_top_k = std::env::var("PRIVSTRIP_DEBUG_TOPK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     for (i, &tid) in token_ids.iter().enumerate() {
         let (bs, be) = offsets[i];
         let token_text = text.get(bs..be).unwrap_or("");
@@ -272,6 +296,14 @@ fn run_debug(engine: &Engine, text: &str) -> Result<ExitCode> {
             engine.label_info.id2label[argmax_id],
             ranked[0].1.exp(),
         );
+        if dump_top_k > 0 {
+            let top: Vec<String> = ranked
+                .iter()
+                .take(dump_top_k)
+                .map(|(id, lp)| format!("{}={:+.6}", engine.label_info.id2label[*id], lp))
+                .collect();
+            println!("    top: {}", top.join(" "));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

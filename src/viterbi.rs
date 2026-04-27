@@ -1,6 +1,104 @@
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use crate::labels::{Boundary, LabelInfo};
 
 const NEG_INF: f32 = -1e9;
+
+/// Viterbi transition biases. The on-disk format is at
+/// `viterbi_calibration.json::operating_points.<name>.biases`. Default operating point
+/// ships with all-zero biases, which is mathematically a no-op vs an unbiased
+/// constraint-only decoder.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct ViterbiBiases {
+    #[serde(default)]
+    pub transition_bias_background_stay: f32,
+    #[serde(default)]
+    pub transition_bias_background_to_start: f32,
+    #[serde(default)]
+    pub transition_bias_inside_to_continue: f32,
+    #[serde(default)]
+    pub transition_bias_inside_to_end: f32,
+    #[serde(default)]
+    pub transition_bias_end_to_background: f32,
+    #[serde(default)]
+    pub transition_bias_end_to_start: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct CalibrationFile {
+    operating_points: BTreeMap<String, OperatingPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OperatingPoint {
+    biases: ViterbiBiases,
+}
+
+impl ViterbiBiases {
+    /// Load the named operating point from a calibration JSON file.
+    pub fn from_calibration_file(path: &Path, operating_point: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let parsed: CalibrationFile = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", path.display()))?;
+        parsed
+            .operating_points
+            .get(operating_point)
+            .map(|op| op.biases)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "operating point {operating_point:?} not found in {}",
+                    path.display()
+                )
+            })
+    }
+
+    /// Look up the bias for one (prev, next) edge per OPF's `_transition_bias` table.
+    /// `prev_is_bg` and `next_is_bg` are pre-computed background checks; tags refer to
+    /// the BIES boundary of each side.
+    fn for_edge(
+        &self,
+        prev_boundary: Boundary,
+        prev_is_bg: bool,
+        next_boundary: Boundary,
+        next_is_bg: bool,
+        same_span: bool,
+    ) -> f32 {
+        if prev_is_bg {
+            if next_is_bg {
+                return self.transition_bias_background_stay;
+            }
+            if matches!(next_boundary, Boundary::B | Boundary::S) {
+                return self.transition_bias_background_to_start;
+            }
+            return 0.0;
+        }
+        match prev_boundary {
+            Boundary::B | Boundary::I => {
+                if same_span && matches!(next_boundary, Boundary::I) {
+                    self.transition_bias_inside_to_continue
+                } else if same_span && matches!(next_boundary, Boundary::E) {
+                    self.transition_bias_inside_to_end
+                } else {
+                    0.0
+                }
+            }
+            Boundary::E | Boundary::S => {
+                if next_is_bg {
+                    self.transition_bias_end_to_background
+                } else if matches!(next_boundary, Boundary::B | Boundary::S) {
+                    self.transition_bias_end_to_start
+                } else {
+                    0.0
+                }
+            }
+            Boundary::Background => 0.0, // unreachable: covered by prev_is_bg above
+        }
+    }
+}
 
 pub struct ViterbiDecoder {
     num_classes: usize,
@@ -10,7 +108,7 @@ pub struct ViterbiDecoder {
 }
 
 impl ViterbiDecoder {
-    pub fn new(label_info: &LabelInfo) -> Self {
+    pub fn with_biases(label_info: &LabelInfo, biases: ViterbiBiases) -> Self {
         let n = label_info.num_classes();
         let bg = label_info.background_idx;
 
@@ -34,9 +132,19 @@ impl ViterbiDecoder {
         let mut transition_scores = vec![NEG_INF; n * n];
         for prev in 0..n {
             for next in 0..n {
-                if is_valid_transition(label_info, prev, next) {
-                    transition_scores[prev * n + next] = 0.0;
+                if !is_valid_transition(label_info, prev, next) {
+                    continue;
                 }
+                let prev_is_bg = prev == bg;
+                let next_is_bg = next == bg;
+                let same_span = label_info.span_label[prev] == label_info.span_label[next];
+                transition_scores[prev * n + next] = biases.for_edge(
+                    label_info.boundary[prev],
+                    prev_is_bg,
+                    label_info.boundary[next],
+                    next_is_bg,
+                    same_span,
+                );
             }
         }
 

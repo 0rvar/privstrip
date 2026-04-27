@@ -1,0 +1,28 @@
+[project]
+name = "privstrip-pyref"
+version = "0.1.0"
+description = "Python reference wrapper around openai/privacy-filter (opf) for three-way validation."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  # Pinned to the exact commit of openai/privacy-filter we read while writing the wrapper.
+  # The repo has no PyPI release; we use git+rev so the lockfile pins it.
+  "opf @ git+https://github.com/openai/privacy-filter.git@main",
+  "torch>=2.4",
+  "safetensors",
+  "tiktoken",
+  "numpy",
+  "huggingface_hub",
+  "packaging",
+]
+
+[tool.uv]
+# CPU-only torch; we run on Apple Silicon and don't need CUDA.
+# Keep the resolver deterministic.
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
