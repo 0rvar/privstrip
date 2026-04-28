@@ -591,14 +591,11 @@ async function main() {
   }
 
   const rustArgs = ["stream", "-m", args.modelDir, ...(args.metal ? ["--metal"] : [])];
-  const rustArgmax = new StreamClient(
-    [args.privstripBin, ...rustArgs, "--decoder", "argmax"],
-    "rust-argmax",
-  );
-  const rustViterbi = new StreamClient(
-    [args.privstripBin, ...rustArgs, "--decoder", "viterbi"],
-    "rust-viterbi",
-  );
+
+  // Each privstrip process holds the f32 model in RAM (~5.6 GB). Run rust
+  // decoders sequentially so peak memory stays at one model. Argmax and
+  // viterbi share the same forward; the only delta is the decode step, so
+  // sequential is also free CPU-wise.
 
   const allPairs: PairKey[] = [
     "A_argmax_vs_C_argmax",
@@ -614,8 +611,45 @@ async function main() {
   const stats: Partial<Record<PairKey, PairStats>> = {};
   for (const k of activePairs) stats[k] = emptyPairStats();
 
-  const startedAt = Date.now();
-  let done = 0;
+  type RustResult = { id: number; spans: Span[] };
+  async function runRustDecoder(decoder: "argmax" | "viterbi"): Promise<Map<number, RustResult>> {
+    const client = new StreamClient(
+      [args.privstripBin, ...rustArgs, "--decoder", decoder],
+      `rust-${decoder}`,
+    );
+    const out = new Map<number, RustResult>();
+    const startedAt = Date.now();
+    let done = 0;
+    try {
+      for (const row of rows) {
+        // Skip rows we won't compare against anyway (no python cache).
+        if (!cache.has(`${decoder}:${row.id}`)) continue;
+        const reply = await client.detect(row.id, row.text);
+        if (reply.error) {
+          process.stderr.write(`\nrust ${decoder} error id=${row.id}: ${reply.error}\n`);
+          continue;
+        }
+        out.set(row.id, { id: row.id, spans: reply.spans ?? [] });
+        done++;
+        if (done % 25 === 0 || done === rows.length) {
+          const elapsed = (Date.now() - startedAt) / 1000;
+          const rate = done / Math.max(elapsed, 1e-3);
+          const eta = (rows.length - done) / Math.max(rate, 1e-3);
+          process.stderr.write(
+            `\rrust ${decoder}: ${done}/${rows.length}  ${rate.toFixed(1)} req/s  eta ${eta.toFixed(0)}s   `,
+          );
+        }
+      }
+    } finally {
+      await client.close();
+    }
+    process.stderr.write("\n");
+    return out;
+  }
+
+  const rustArgmaxResults = await runRustDecoder("argmax");
+  const rustViterbiResults = await runRustDecoder("viterbi");
+
   let pythonMismatches = 0;
   let skippedNoCache = 0;
   for (const row of rows) {
@@ -630,47 +664,27 @@ async function main() {
       // We still compare — but spans may refer to the decoded form, not the input.
       // The row will likely show as a mismatch in pairs involving Python; that's expected.
     }
+    const rA = rustArgmaxResults.get(row.id);
+    const rV = rustViterbiResults.get(row.id);
+    if (!rA || !rV) continue;
 
-    const tasks: Promise<unknown>[] = [
-      rustArgmax.detect(row.id, row.text),
-      rustViterbi.detect(row.id, row.text),
-    ];
-    if (tjsPipe) {
-      tasks.push(tjsPipe(row.text, { aggregation_strategy: "none" }));
-    }
-    const [rA, rV, tjsRaw] = (await Promise.all(tasks)) as [StreamReply, StreamReply, RawTok[] | undefined];
-
-    if (rA.error || rV.error) {
-      process.stderr.write(`\nrust error id=${row.id}: argmax=${rA.error} viterbi=${rV.error}\n`);
-      continue;
-    }
-    const oracle = tjsPipe && tjsRaw && tjsTokenizer
-      ? await tjsToSpans(row.text, tjsTokenizer, tjsRaw)
+    const oracle = tjsPipe && tjsTokenizer
+      ? await tjsToSpans(
+          row.text,
+          tjsTokenizer,
+          (await tjsPipe(row.text, { aggregation_strategy: "none" })) as RawTok[],
+        )
       : [];
 
-    recordPair(stats.A_argmax_vs_C_argmax!, row, rA.spans!, pyA.spans, args.showExamples);
-    recordPair(stats.A_viterbi_vs_C_viterbi!, row, rV.spans!, pyV.spans, args.showExamples);
+    recordPair(stats.A_argmax_vs_C_argmax!, row, rA.spans, pyA.spans, args.showExamples);
+    recordPair(stats.A_viterbi_vs_C_viterbi!, row, rV.spans, pyV.spans, args.showExamples);
     if (args.js) {
       recordPair(stats.B_vs_C_argmax!, row, oracle, pyA.spans, args.showExamples);
       recordPair(stats.B_vs_C_viterbi!, row, oracle, pyV.spans, args.showExamples);
-      recordPair(stats.A_argmax_vs_B!, row, rA.spans!, oracle, args.showExamples);
-      recordPair(stats.A_viterbi_vs_B!, row, rV.spans!, oracle, args.showExamples);
-    }
-
-    done++;
-    if (done % 10 === 0 || done === rows.length) {
-      const elapsed = (Date.now() - startedAt) / 1000;
-      const rate = done / Math.max(elapsed, 1e-3);
-      const eta = (rows.length - done) / Math.max(rate, 1e-3);
-      process.stderr.write(
-        `\rcompare: ${done}/${rows.length}  ${rate.toFixed(1)} req/s  eta ${eta.toFixed(0)}s   `,
-      );
+      recordPair(stats.A_argmax_vs_B!, row, rA.spans, oracle, args.showExamples);
+      recordPair(stats.A_viterbi_vs_B!, row, rV.spans, oracle, args.showExamples);
     }
   }
-  process.stderr.write("\n");
-
-  await rustArgmax.close();
-  await rustViterbi.close();
 
   const refStats = stats[activePairs[0]!]!;
   console.log("=== agreement matrix ===");

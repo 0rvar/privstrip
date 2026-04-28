@@ -27,6 +27,10 @@
 
             # Validation harness.
             bun
+
+            # Profiler used to validate the optimization pass against the
+            # bf16/f32 baseline (CPU + Metal forward).
+            samply
           ];
 
           shellHook = ''

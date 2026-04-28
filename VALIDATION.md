@@ -43,11 +43,11 @@ Rust-vs-Python matrix is what most correctness work needs.
 | `A_argmax_vs_B`            | Rust argmax  vs transformers.js | 96.40% | 18 | 42 | 27 |
 | `A_viterbi_vs_B`           | Rust viterbi vs transformers.js | 93.20% | 34 | 42 | 71 |
 
-The `B_vs_C_viterbi` and `A_viterbi_vs_B` rows are noisier than the others
-because `transformers.js` does not run our Viterbi decoder — it uses
-per-token argmax internally. Comparing argmax-style spans against
-Viterbi-decoded spans surfaces structural differences, not implementation
-divergence.
+The `B_vs_C_viterbi` and `A_viterbi_vs_B` rows compare different decoder
+outputs (Viterbi vs argmax-style) and don't measure implementation parity
+directly. `transformers.js` does not run our Viterbi decoder — it uses
+per-token argmax internally — so disagreements on those rows surface
+structural differences between the decoders, not bugs in either runtime.
 
 ## Conclusion (Step 3)
 
@@ -159,10 +159,11 @@ most of that advantage comes from staying in f32 and avoiding the cast
 shuffles. A future revision could revisit this once Candle bf16 support
 is stronger.
 
-We accept the residual: 99.00% Viterbi agreement and 96.80% argmax
-agreement on the 500-row corpus, with every one of the 21 mismatched
-rows traceable to a specific bf16/f32 precision-tie flip rather than a
-bug.
+For the opt-in client-side privacy aid use case, with server-side
+stripping as the compliance boundary, 99.00% Viterbi agreement is
+acceptable — the 5 mismatches are bf16/f32 precision drift, not
+algorithmic divergence. The 21 mismatched rows across both decoders are
+all traceable to specific precision-tie flips rather than bugs.
 
 ### Viterbi calibration loader
 

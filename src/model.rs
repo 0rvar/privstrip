@@ -1,17 +1,28 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
 
 use crate::config::ModelConfig;
+use crate::timing::{Stage, time_stage};
 
 pub struct Transformer {
     pub embedding: Tensor,
     pub blocks: Vec<TransformerBlock>,
     pub final_norm: RmsNorm,
-    pub unembedding: Tensor,
     pub sliding_window: usize,
+    // Bidirectional sliding-window mask depends only on (T, sliding_window,
+    // device, dtype). The window/device/dtype are fixed per Transformer
+    // instance, so caching by T avoids rebuilding the same TxT tensor on every
+    // forward pass. Cap is bounded by the RoPE table size (<= 8192).
+    mask_cache: Mutex<HashMap<usize, Tensor>>,
+    // Materialized transpose of the unembedding matrix. matmul needs the
+    // contiguous form; doing the transpose+contiguous once at load-time saves
+    // the copy on every forward.
+    unembedding_t: Tensor,
 }
 
 pub struct TransformerBlock {
@@ -78,13 +89,27 @@ impl Transformer {
             blocks.push(TransformerBlock { attn, mlp });
         }
 
+        let unembedding_t = unembedding.t()?.contiguous()?;
         Ok(Self {
             embedding,
             blocks,
             final_norm,
-            unembedding,
+            unembedding_t,
             sliding_window,
+            mask_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn cached_mask(&self, t: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+        {
+            let cache = self.mask_cache.lock().unwrap();
+            if let Some(m) = cache.get(&t) {
+                return Ok(m.clone());
+            }
+        }
+        let m = bidirectional_sliding_mask(t, self.sliding_window, device, dtype)?;
+        let mut cache = self.mask_cache.lock().unwrap();
+        Ok(cache.entry(t).or_insert(m).clone())
     }
 
     /// Forward pass. `tokens` is a 1-D u32 Tensor of length T. Returns logits [T, num_classes] in f32.
@@ -99,15 +124,15 @@ impl Transformer {
 
         let device = tokens.device().clone();
         let dtype = self.embedding.dtype();
-        let mask = bidirectional_sliding_mask(t, self.sliding_window, &device, dtype)?;
+        let mask = self.cached_mask(t, &device, dtype)?;
 
         let mut x = self.embedding.index_select(tokens, 0)?; // [T, hidden]
         for block in &self.blocks {
-            x = block.attn.forward(&x, &mask)?;
+            x = time_stage(Stage::ForwardAttn, || block.attn.forward(&x, &mask))?;
             x = block.mlp.forward(&x)?;
         }
         let x = self.final_norm.forward(&x)?;
-        let logits = x.matmul(&self.unembedding.t()?.contiguous()?)?; // [T, num_classes]
+        let logits = x.matmul(&self.unembedding_t)?; // [T, num_classes]
         Ok(logits)
     }
 
@@ -276,71 +301,91 @@ impl MLPBlock {
         let dtype = x.dtype();
 
         let normed = self.norm.forward(x)?;
-        let gate_logits = self.gate.forward(&normed)?; // [T, num_experts]
+        let (token_idx_t, weights_t, bucket_offsets) =
+            time_stage(Stage::ForwardMoeRoute, || -> Result<_> {
+                let gate_logits = self.gate.forward(&normed)?; // [T, num_experts]
+                // candle 0.10 has no on-device topk and narrow() requires
+                // host-side usize, so per-expert dispatch must read the
+                // gating logits to host. On Metal this synchronizes the
+                // command queue 8× per forward (~15ms/sync) — see
+                // BENCHMARKS.md. The forward already runs in f32 so no cast
+                // is needed before to_vec2.
+                let gate_logits_f32 = time_stage(Stage::ForwardMoeRouteSync, || -> Result<_> {
+                    Ok(gate_logits.to_vec2::<f32>()?)
+                })?;
+                let k = self.experts_per_tok;
+                let mut indices_flat: Vec<u32> = Vec::with_capacity(t * k);
+                let mut weights_flat: Vec<f32> = Vec::with_capacity(t * k);
+                for token_logits in &gate_logits_f32 {
+                    let (top_idx, top_logits) = top_k(token_logits, k);
+                    let max = top_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let exps: Vec<f32> = top_logits.iter().map(|l| (l - max).exp()).collect();
+                    let sum: f32 = exps.iter().sum();
+                    for j in 0..k {
+                        indices_flat.push(top_idx[j] as u32);
+                        weights_flat.push(exps[j] / sum);
+                    }
+                }
 
-        let gate_logits_f32 = gate_logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        let k = self.experts_per_tok;
-        let mut indices_flat: Vec<u32> = Vec::with_capacity(t * k);
-        let mut weights_flat: Vec<f32> = Vec::with_capacity(t * k);
-        for token_logits in &gate_logits_f32 {
-            let (top_idx, top_logits) = top_k(token_logits, k);
-            let max = top_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = top_logits.iter().map(|l| (l - max).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            for j in 0..k {
-                indices_flat.push(top_idx[j] as u32);
-                weights_flat.push(exps[j] / sum);
+                // Build a single dispatch tensor per layer rather than one per
+                // expert. sort_by_key is stable, so within each expert's bucket
+                // tokens stay in ascending index order.
+                let total = t * k;
+                let mut order: Vec<usize> = (0..total).collect();
+                order.sort_by_key(|&i| indices_flat[i]);
+
+                let mut sorted_token_idx: Vec<u32> = Vec::with_capacity(total);
+                let mut sorted_weights: Vec<f32> = Vec::with_capacity(total);
+                let mut bucket_offsets: Vec<usize> = vec![0usize; self.num_experts + 1];
+                for &i in &order {
+                    sorted_token_idx.push((i / k) as u32);
+                    sorted_weights.push(weights_flat[i]);
+                    bucket_offsets[indices_flat[i] as usize + 1] += 1;
+                }
+                for e in 0..self.num_experts {
+                    bucket_offsets[e + 1] += bucket_offsets[e];
+                }
+
+                // Two host->device transfers for dispatch metadata per layer
+                // instead of ~2 * num_active_experts. narrow() below is
+                // metadata-only.
+                let token_idx_t = Tensor::from_vec(sorted_token_idx, total, device)?;
+                let weights_t =
+                    Tensor::from_vec(sorted_weights, (total, 1), device)?.to_dtype(dtype)?;
+                Ok((token_idx_t, weights_t, bucket_offsets))
+            })?;
+
+        let out = time_stage(Stage::ForwardMoeExpert, || -> Result<_> {
+            let mut out = Tensor::zeros((t, h), dtype, device)?;
+            for e in 0..self.num_experts {
+                let start = bucket_offsets[e];
+                let n_e = bucket_offsets[e + 1] - start;
+                if n_e == 0 {
+                    continue;
+                }
+                let token_idx = token_idx_t.narrow(0, start, n_e)?;
+                let weights_col = weights_t.narrow(0, start, n_e)?;
+
+                let x_e = normed.index_select(&token_idx, 0)?; // [n_e, hidden]
+
+                // Indexing along the leading dim of a contiguous
+                // [num_experts, ..., ...] tensor yields a contiguous slice;
+                // candle's matmul accepts the slice directly, so the prior
+                // .contiguous() copy was redundant.
+                let w1 = self.mlp1_weight.i(e)?; // [hidden, 2*intermediate]
+                let b1 = self.mlp1_bias.i(e)?; // [2*intermediate]
+                let h1 = x_e.matmul(&w1)?.broadcast_add(&b1)?;
+                let h1 = swiglu(&h1, self.swiglu_limit)?; // [n_e, intermediate]
+
+                let w2 = self.mlp2_weight.i(e)?; // [intermediate, hidden]
+                let b2 = self.mlp2_bias.i(e)?; // [hidden]
+                let h2 = h1.matmul(&w2)?.broadcast_add(&b2)?;
+
+                let weighted = h2.broadcast_mul(&weights_col)?; // [n_e, hidden]
+                out = out.index_add(&token_idx, &weighted, 0)?;
             }
-        }
-
-        // Build a single dispatch tensor per layer rather than one per expert.
-        // sort_by_key is stable, so within each expert's bucket tokens stay in
-        // ascending index order (matches the prior per_expert push order).
-        let total = t * k;
-        let mut order: Vec<usize> = (0..total).collect();
-        order.sort_by_key(|&i| indices_flat[i]);
-
-        let mut sorted_token_idx: Vec<u32> = Vec::with_capacity(total);
-        let mut sorted_weights: Vec<f32> = Vec::with_capacity(total);
-        let mut bucket_offsets: Vec<usize> = vec![0usize; self.num_experts + 1];
-        for &i in &order {
-            sorted_token_idx.push((i / k) as u32);
-            sorted_weights.push(weights_flat[i]);
-            bucket_offsets[indices_flat[i] as usize + 1] += 1;
-        }
-        for e in 0..self.num_experts {
-            bucket_offsets[e + 1] += bucket_offsets[e];
-        }
-
-        // Two host->device transfers for dispatch metadata per layer instead of
-        // ~2 * num_active_experts. narrow() below is metadata-only.
-        let token_idx_t = Tensor::from_vec(sorted_token_idx, total, device)?;
-        let weights_t = Tensor::from_vec(sorted_weights, (total, 1), device)?.to_dtype(dtype)?;
-
-        let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for e in 0..self.num_experts {
-            let start = bucket_offsets[e];
-            let n_e = bucket_offsets[e + 1] - start;
-            if n_e == 0 {
-                continue;
-            }
-            let token_idx = token_idx_t.narrow(0, start, n_e)?;
-            let weights_col = weights_t.narrow(0, start, n_e)?;
-
-            let x_e = normed.index_select(&token_idx, 0)?; // [n_e, hidden]
-
-            let w1 = self.mlp1_weight.i(e)?.contiguous()?; // [hidden, 2*intermediate]
-            let b1 = self.mlp1_bias.i(e)?; // [2*intermediate]
-            let h1 = x_e.matmul(&w1)?.broadcast_add(&b1)?;
-            let h1 = swiglu(&h1, self.swiglu_limit)?; // [n_e, intermediate]
-
-            let w2 = self.mlp2_weight.i(e)?.contiguous()?; // [intermediate, hidden]
-            let b2 = self.mlp2_bias.i(e)?; // [hidden]
-            let h2 = h1.matmul(&w2)?.broadcast_add(&b2)?;
-
-            let weighted = h2.broadcast_mul(&weights_col)?; // [n_e, hidden]
-            out = out.index_add(&token_idx, &weighted, 0)?;
-        }
+            Ok(out)
+        })?;
 
         x.add(&out).map_err(Into::into)
     }
@@ -429,8 +474,12 @@ fn build_yarn_rope(
     let initial_ctx = config.rope_parameters.original_max_position_embeddings as f64;
     let ntk_alpha = config.rope_parameters.beta_slow;
     let ntk_beta = config.rope_parameters.beta_fast;
-    // Cap the precomputed table at a generous but bounded length.
-    let max_pos = ((initial_ctx * scaling_factor) as usize).min(8192);
+    // Cap the precomputed table at a generous but bounded length. The model
+    // architecture supports up to 131072 positions, but the table is
+    // (max_pos, head_dim/2) f32 -> at 16384 the table is 16384*32*2*4 = ~4 MiB
+    // per head_dim/2 slice (cos+sin), trivial. We rarely see >2k tokens in
+    // production but raise the ceiling for safety on cloud-log inputs.
+    let max_pos = ((initial_ctx * scaling_factor) as usize).min(16384);
 
     let freq: Vec<f64> = (0..d_half)
         .map(|i| base.powf((2.0 * i as f64) / d as f64))

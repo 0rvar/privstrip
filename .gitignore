@@ -13,3 +13,9 @@ python-ref/.python-version
 
 # three-way-validate cache (large)
 scripts/.python-cache.jsonl
+
+.direnv/
+/result
+
+# Pre-merge regression check writes this each run.
+/validation-matrix.json

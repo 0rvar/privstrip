@@ -23,6 +23,7 @@ The model recognizes 8 entity types (`account_number`, `private_address`, `priva
   - `labels.rs` — config-driven label/boundary metadata
   - `spans.rs` — token-id → byte-span extraction, whitespace trimming, dedup
   - `config.rs` — model-config deserialization
+  - `timing.rs` — opt-in per-stage wall-clock instrumentation gated by `PRIVSTRIP_TIMING=1`
 - `models/` — model artifacts (gitignored)
   - `model.safetensors` (~2.8 GB bf16) — the weights we actually use
   - `tokenizer.json`, `tokenizer_config.json` — o200k_base BPE
@@ -30,13 +31,15 @@ The model recognizes 8 entity types (`account_number`, `private_address`, `priva
   - `viterbi_calibration.json` — Viterbi transition biases. Auto-loaded at startup; the shipped `default` operating point has all-zero biases (a no-op vs constraint-only decoding). Override with `--operating-point <name>`.
   - `onnx/` — ONNX export from upstream (kept for the validation oracle to load via transformers.js, see below). Candle cannot run the ONNX (see "What didn't work")
 - `python-ref/` — Python reference (oracle C). Standalone uv project that wraps the official `opf` package and exposes the same JSONL stream protocol as `privstrip stream`. See `python-ref/README.md`.
-- `flake.nix` — dev shell providing cargo + rustc + uv + python311 + bun.
+- `flake.nix` — dev shell providing cargo + rustc + uv + python311 + bun + samply.
 - `scripts/`
-  - `validate.ts` — primary harness. Spawns Rust (argmax + viterbi) and `python-ref/run_reference.py` (argmax + viterbi); compares spans pairwise. Reads Python results from `scripts/.python-cache.jsonl` and auto-populates any missing rows (pass `--no-python` to skip them instead, `--refresh-python` to clear the cache and re-run all). Pass `--js` to also load the transformers.js oracle and emit the full 6-pair matrix.
+  - `validate.ts` — primary harness. Spawns Rust (argmax then viterbi, **sequentially** — each privstrip process is ~5.6 GB resident, parallel runs OOM and double-up the GPU command queue) and `python-ref/run_reference.py` (argmax + viterbi); compares spans pairwise. Reads Python results from `scripts/.python-cache.jsonl` and auto-populates any missing rows (pass `--no-python` to skip them instead, `--refresh-python` to clear the cache and re-run all). Pass `--js` to also load the transformers.js oracle and emit the full 6-pair matrix.
+  - `regression-check.ts` — pre-merge gate: builds the binary, runs `validate.ts --no-python`, exits non-zero if A↔C argmax drops below 96.80% or A↔C viterbi drops below 99.00%. ~2 min on CPU. Use this after any change to `model.rs`/`spans.rs`/`viterbi.rs`.
+  - `bench-stream.ts` — repeatable per-row latency benchmark. Same protocol as `validate.ts` but skips comparison. Reports median/p90/p99/throughput from the binary's own `elapsed_us` field. Excludes the cold first row by default.
   - `corpus.jsonl` — 500 English rows from `ai4privacy/pii-masking-300k`, fetched on demand by `validate.ts`.
   - `smoke-stream.ts` — minimal end-to-end smoke test of the stream protocol.
 - `VALIDATION.md` — agreement matrix, residual analysis (bf16/f32 drift), and which fixes landed.
-- `BENCHMARKS.md` — per-row latency for Rust (CPU + Metal) and Python on the corpus.
+- `BENCHMARKS.md` — per-row latency for Rust (CPU + Metal) and Python on the corpus, with per-stage timing breakdown.
 
 ## Architecture cheat-sheet
 
@@ -113,20 +116,42 @@ Validation runs both modes to catch regressions in either path.
 
 - **candle-onnx (0.10.x) cannot run the upstream ONNX export.** It's missing `TopK`, `ScatterND`, `GatherND`, `Loop`, and `LayerNormalization`. We load `model.safetensors` directly into hand-written candle ops instead. Don't try to switch to ONNX without first checking whether candle has gained those ops.
 - **The official Python `opf` package's HF config differs from the checkpoint's `config.json`.** OPF expects a flat schema (`num_experts`, `bidirectional_context`, flattened `rope_*` keys) while the HF file uses `num_local_experts`, nested `rope_parameters`, etc. `python-ref/run_reference.py::build_opf_config` translates between them and writes a side-car checkpoint dir with the patched config + a symlink to the original `model.safetensors`. If `opf` upstream changes its config schema, that translator is the thing to update.
-- **Long inputs:** `build_yarn_rope` caps the precomputed RoPE table at 8192 positions. `Transformer::forward` rejects inputs longer than that with a clear error. To support longer inputs, raise the cap there — the model's `max_position_embeddings` is 131072 so the architecture itself supports more.
+- **Long inputs:** `build_yarn_rope` caps the precomputed RoPE table at 16384 positions. `Transformer::forward` rejects inputs longer than that with a clear error. To support longer inputs, raise the cap there — the model's `max_position_embeddings` is 131072 so the architecture itself supports more. At long T (≥10k tokens), CPU is *faster* than Metal because each per-layer Metal sync drains a much larger GPU backlog (see BENCHMARKS.md).
 - **Closing the bf16/f32 precision gap on A↔C** would require casting Q/K/V and the attention output back to bf16 between RoPE and the einsums, mirroring `opf`'s `sdpa`. Candle 0.10.x bf16 op coverage on CPU is not complete, and matching the recipe would tightly couple the forward pass to the reference. We accept the residual; see `VALIDATION.md` Cluster D.
-- **Metal is only ~6–13% faster than CPU on the corpus.** The MoE expert dispatch needs CPU-side top-k routing, forcing a device→host sync 8 times per forward. With ~100-token median rows, per-kernel GPU launch overhead also eats the gain. First Metal call is ~10–13 s (kernel compilation + RoPE table upload). Larger inputs would amortize this better, but we have not benchmarked them.
+- **Metal is only ~6–13% faster than CPU on the corpus.** Confirmed root cause: per-layer device→host sync in `MLPBlock::forward`. The gating logits must come back to host so per-expert dispatch can call `Tensor::narrow(0, start, len)` with bucket-aware host-side `usize` arguments. candle 0.10 has **no on-device `topk`, no `nonzero`, and no `narrow` with tensor-shaped bounds** (research: `candle-core-0.10.2/src/sort.rs:260` exists but `topk` does not). Each sync is ~15 ms × 8 layers = 118 ms wasted per forward, dominating Metal latency. candle-transformers' own `mixtral.rs SparseMoeBlock` does the same `to_vec2` host sync. Two viable redesigns (masked dense or token-replicate + bmm) trade either ~32× more compute or huge memory copies; neither beats the current behavior at typical token counts. **Revisit when candle gains on-device topk** (it's on candle's main branch but not in 0.10). First Metal call is still ~11–13 s (kernel compilation + RoPE table upload).
 
 ## Performance notes
 
 The sparse MoE forward pass is the hot loop. Notable optimizations already in place:
 
-- Sliding-window attention mask is built **once per forward** in `Transformer::forward` and passed to all 8 attention blocks, not rebuilt per block.
+- Sliding-window attention mask is built **once per forward** in `Transformer::forward` and **cached on the `Transformer`** keyed by T. Repeat token counts hit the cache (Tensor::clone is an Arc bump). Initial per-T construction is the only cost; subsequent forwards at the same length pay nothing.
 - MoE expert dispatch builds **one** flat `[T*k]` token-index tensor and one weights tensor per layer, then `narrow()`s per expert (metadata-only, no copy). Without this, Metal would fire ~160 small host→device uploads per layer.
+- The unembedding transpose is precomputed once at load (`Transformer::unembedding_t`) instead of materializing `unembedding.t()?.contiguous()?` on every forward.
+- Per-expert `mlp1_weight.i(e)?.contiguous()?` calls were dropped — indexing along the leading dim of a contiguous `[num_experts, hidden, ...]` tensor yields a contiguous slice already, so the explicit `.contiguous()` was an unnecessary copy on every active expert per layer per forward.
 
 What's deliberately not optimized yet:
-- Top-k routing still happens on CPU. With candle's current API there's no fused MoE op, and per-expert dispatch needs token-to-expert assignments on the host anyway. One device→host sync per layer is unavoidable without a custom kernel.
-- Viterbi's inner loop iterates the full 33×33 transition matrix despite ~80% of transitions being `-inf`. Fast enough for typical inputs (<1 ms for <1k tokens); revisit if profiling shows it.
+- Top-k routing still happens on CPU. candle 0.10 has no on-device `topk` and `Tensor::narrow` requires host-side `usize` for `start`/`len`, so per-expert dispatch with runtime bucket sizes can't run on-device. See "What didn't work" above for the dead-end research; revisit when candle gains on-device topk.
+- Viterbi's inner loop iterates the full 33×33 transition matrix despite ~80% of transitions being `-inf`. Profiling shows decode at 0.05% of CPU and 0.08% of Metal wall time, far below the ~2% threshold for being worth optimizing. Skip until profiling shows it matters.
+
+## Profiling and timing instrumentation
+
+Set `PRIVSTRIP_TIMING=1` to enable per-stage wall-clock instrumentation. The
+binary aggregates time spent in tokenize / forward (split into attn /
+moe_route / moe_route_sync / moe_expert) / logits (with logits_sync
+isolated) / decode / span_extract / serialize, and prints a summary to
+stderr at end-of-stream. The fast path is gated on a `OnceLock<bool>` so
+the binary pays at most an atomic-load per call site when the env var is
+unset.
+
+```fish
+PRIVSTRIP_TIMING=1 target/release/privstrip stream -m models < scripts/corpus.jsonl > /dev/null
+```
+
+`samply` is in the dev shell. On macOS samply needs Developer Mode enabled
+(`sudo DevToolsSecurity -enable`) AND, if running under
+`claude-sandbox`, the `(target same-sandbox)` predicate dropped from
+`mach-priv-task-port` / `process-info*` (otherwise: `Encountered an error
+during profiling: Unknown(1100)`).
 
 ## Conventions
 

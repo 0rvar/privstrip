@@ -2,6 +2,7 @@ mod config;
 mod labels;
 mod model;
 mod spans;
+mod timing;
 mod viterbi;
 
 use std::io::{BufRead, Read, Write};
@@ -18,6 +19,7 @@ use crate::config::ModelConfig;
 use crate::labels::LabelInfo;
 use crate::model::Transformer;
 use crate::spans::{DetectedSpan, extract_spans, redact};
+use crate::timing::{Stage, time_stage};
 use crate::viterbi::{ViterbiBiases, ViterbiDecoder};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -153,10 +155,11 @@ impl Engine {
         if text.is_empty() {
             return Ok(DetectionResult::default());
         }
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let encoding = time_stage(Stage::Tokenize, || {
+            self.tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))
+        })?;
         let token_ids = encoding.get_ids().to_vec();
         let offsets: Vec<(usize, usize)> = encoding.get_offsets().to_vec();
         let tokens_count = token_ids.len();
@@ -165,15 +168,24 @@ impl Engine {
         }
 
         let tokens = Tensor::from_vec(token_ids.clone(), tokens_count, &self.device)?;
-        let logits = self.model.forward(&tokens)?;
-        let log_probs = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
-        let log_probs_v: Vec<f32> = log_probs.flatten_all()?.to_vec1()?;
+        let logits = time_stage(Stage::Forward, || self.model.forward(&tokens))?;
+        let log_probs_v = time_stage(Stage::Logits, || -> Result<Vec<f32>> {
+            let log_probs = ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
+            let flat = log_probs.flatten_all()?;
+            // The to_vec1 call forces a device->host sync on Metal. Time it
+            // separately so we can see the sync cost vs the softmax math.
+            time_stage(Stage::LogitsSync, || flat.to_vec1::<f32>().map_err(Into::into))
+        })?;
 
-        let label_path = match self.decoder_mode {
+        let label_path = time_stage(Stage::Decode, || match self.decoder_mode {
             DecoderMode::Viterbi => self.decoder.decode(&log_probs_v, tokens_count),
-            DecoderMode::Argmax => argmax_decode(&log_probs_v, tokens_count, self.label_info.num_classes()),
-        };
-        let spans = extract_spans(&label_path, &offsets, text, &self.label_info);
+            DecoderMode::Argmax => {
+                argmax_decode(&log_probs_v, tokens_count, self.label_info.num_classes())
+            }
+        });
+        let spans = time_stage(Stage::SpanExtract, || {
+            extract_spans(&label_path, &offsets, text, &self.label_info)
+        });
         Ok(DetectionResult { spans, tokens: tokens_count })
     }
 }
@@ -201,10 +213,14 @@ fn run_stream(engine: &Engine) -> Result<ExitCode> {
             continue;
         }
         let response = process_stream_line(engine, trimmed);
-        serde_json::to_writer(&mut out, &response)?;
-        out.write_all(b"\n")?;
-        out.flush()?;
+        time_stage(Stage::Serialize, || -> Result<()> {
+            serde_json::to_writer(&mut out, &response)?;
+            out.write_all(b"\n")?;
+            out.flush()?;
+            Ok(())
+        })?;
     }
+    crate::timing::report(&mut std::io::stderr())?;
     Ok(ExitCode::SUCCESS)
 }
 
