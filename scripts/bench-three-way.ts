@@ -233,23 +233,15 @@ async function main() {
   const results: RunResult[] = [];
 
   results.push(
-    await runOne(
-      "rust-cpu",
-      [bin, "stream", "-m", modelDir, "--decoder", "viterbi"],
-      rows,
-    ),
+    await runOne("rust-cpu", [bin, "stream", "-m", modelDir], rows),
   );
   results.push(
-    await runOne(
-      "rust-metal",
-      [bin, "--metal", "stream", "-m", modelDir, "--decoder", "viterbi"],
-      rows,
-    ),
+    await runOne("rust-metal", [bin, "--metal", "stream", "-m", modelDir], rows),
   );
   if (!values["skip-python"]) {
     results.push(
       await runOne(
-        "python",
+        "python-mps",
         [
           "uv",
           "run",
@@ -262,8 +254,7 @@ async function main() {
           "stream",
           "-m",
           modelDir,
-          "--decoder",
-          "viterbi",
+          "--mps",
         ],
         rows,
       ),

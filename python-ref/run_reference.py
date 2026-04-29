@@ -118,6 +118,7 @@ def load_reference(
     decoder: str,
     context_window_length: int,
     calibration_path: Path | None,
+    device: str,
 ) -> Reference:
     # Defer the import so --help works even if opf isn't installed.
     from opf import OPF, DecodeOptions  # noqa: F401
@@ -127,7 +128,7 @@ def load_reference(
 
     opf_obj = OPF(
         model=str(workdir),
-        device="cpu",
+        device=device,
         decode_mode=decoder,
         context_window_length=context_window_length,
         trim_whitespace=True,
@@ -290,14 +291,30 @@ def main() -> int:
     )
     p.add_argument("-t", "--text", type=str, default=None, help="For debug mode")
     p.add_argument("-f", "--file", type=Path, default=None, help="For debug mode")
+    p.add_argument(
+        "--mps",
+        action="store_true",
+        help="Run on Apple GPU via PyTorch's MPS backend instead of CPU. "
+             "Performance only — validation should stay on CPU for determinism.",
+    )
     args = p.parse_args()
 
-    log(f"loading opf reference (decoder={args.decoder}, n_ctx={args.context_window_length})...")
+    device = "mps" if args.mps else "cpu"
+    if args.mps:
+        # opf forces Triton-backed MoE kernels when device != cpu, but Triton
+        # has no Apple-Silicon backend. Setting OPF_MOE_TRITON=0 makes opf
+        # fall back to the plain PyTorch MoE path on MPS.
+        os.environ.setdefault("OPF_MOE_TRITON", "0")
+    log(
+        f"loading opf reference (decoder={args.decoder}, "
+        f"n_ctx={args.context_window_length}, device={device})..."
+    )
     ref = load_reference(
         models_dir=args.model_dir,
         decoder=args.decoder,
         context_window_length=args.context_window_length,
         calibration_path=args.calibration,
+        device=device,
     )
     log("ready")
 
