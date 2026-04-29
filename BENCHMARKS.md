@@ -105,14 +105,38 @@ candle 0.10.2 has no on-device `topk`, no `nonzero`, and `Tensor::narrow`
 takes host-side `usize` for `start`/`len`. Per-expert dispatch with
 runtime-shaped buckets requires reading the assignments to host, which
 is the sync. Even candle-transformers' own `mixtral.rs` `SparseMoeBlock`
-does the same `to_vec2` host sync. Two viable redesigns
-(masked dense MoE eval, or token-replicate + bmm) were considered:
-both either trade ~32× more compute for the eliminated sync or
-explode memory by ~1 MB/token of replicated expert weights, neither
-of which beats the current behaviour at the corpus's typical token
-counts. See `src/model.rs::MLPBlock::forward` for the inline comment;
-revisit when candle adds on-device topk (it's on candle's main branch
-but not in the 0.10 line we pin to).
+does the same `to_vec2` host sync.
+
+**Masked-dense MoE eval was prototyped and measured** (compose
+`arg_sort_last_dim` + `narrow` + `gather` for on-device top-k, build a
+`[T, E]` routing mask via `scatter_add`, then run all 128 experts with a
+single batched matmul on a replicated `[E, T, H]` input). The bet was
+"32× more flops is cheaper than 8 syncs." It wasn't, by a wide margin:
+
+| Path | Median (Metal, viterbi, 500 rows) |
+|---|---|
+| Sparse + 8 syncs (current) | 187 ms |
+| Masked-dense, no syncs | 745 ms |
+
+Per-stage timing showed the sync didn't disappear, it migrated: with
+the 8 in-forward syncs gone, all the GPU work coalesced into the next
+mandatory sync (the end-of-forward `to_vec1` for log-softmax), where
+`logits_sync` jumped from 16 ms/call to 819 ms/call. The dense path's
+batched matmuls — `[128, T, H] @ [128, H, 2I]` at the corpus's typical
+T ≈ 100 — don't pack well enough on Apple Silicon to amortize the 32×
+flop multiplier; the contiguous replication of `normed` to `[E, T, H]`
+is also non-trivial (~62 MiB f32 per layer of pure copy). At larger T
+the dense path may swing the other way, but the corpus is short-input
+heavy.
+
+Token-replicate + bmm-with-gathered-weights was rejected before
+prototyping: it would materialize ~1.3 GB of expert weights per layer.
+
+Net: the per-layer host sync stays. Revisit when candle gains on-device
+`topk` and tensor-shaped `narrow` (both are on candle's main branch but
+not in the 0.10 line we pin to) — true sparse on-device dispatch is the
+only redesign that wouldn't either re-introduce the sync, blow up
+memory, or do 32× more work for shapes where it doesn't pay.
 
 ## Long inputs
 
