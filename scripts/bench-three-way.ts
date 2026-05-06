@@ -41,6 +41,7 @@ interface RunResult {
   rowsMeasured: number;
   elapsedMs: number[];
   tokens: number[];
+  toksPerSec: number[];
   coldFirstRowMs: number | null;
   wallTotalMs: number;
   errors: number;
@@ -115,14 +116,12 @@ async function runOne(label: string, cmd: string[], rows: Row[]): Promise<RunRes
   await readerPromise;
   await proc.exited;
 
-  const elapsedMs = replies
-    .slice(1)
-    .map((r) => (r.elapsed_us ?? 0) / 1000)
-    .filter((v) => v > 0);
-  const tokens = replies
-    .slice(1)
-    .map((r) => r.tokens ?? 0)
-    .filter((v) => v > 0);
+  const warm = replies.slice(1);
+  const elapsedMs = warm.map((r) => (r.elapsed_us ?? 0) / 1000).filter((v) => v > 0);
+  const tokens = warm.map((r) => r.tokens ?? 0).filter((v) => v > 0);
+  const toksPerSec = warm
+    .filter((r) => (r.elapsed_us ?? 0) > 0 && (r.tokens ?? 0) > 0)
+    .map((r) => (r.tokens as number) / ((r.elapsed_us as number) / 1_000_000));
 
   const errors = replies.filter((r) => r.error).length;
   if (errors) process.stderr.write(`[${label}] ${errors} error rows\n`);
@@ -134,6 +133,7 @@ async function runOne(label: string, cmd: string[], rows: Row[]): Promise<RunRes
     rowsMeasured: elapsedMs.length,
     elapsedMs,
     tokens,
+    toksPerSec,
     coldFirstRowMs: replies[0]?.elapsed_us ? replies[0].elapsed_us / 1000 : null,
     wallTotalMs,
     errors,
@@ -163,6 +163,8 @@ function printComparison(results: RunResult[]) {
     { h: "p99", w: 10 },
     { h: "mean", w: 10 },
     { h: "req/s", w: 8 },
+    { h: "tok/s med", w: 11 },
+    { h: "tok/s mean", w: 12 },
     { h: "vs cpu", w: 8 },
     { h: "cold", w: 10 },
   ];
@@ -176,6 +178,8 @@ function printComparison(results: RunResult[]) {
     const median = pct(r.elapsedMs, 50);
     const reqPerS = r.rows / (r.wallTotalMs / 1000);
     const speedup = baselineMedian / median;
+    const tokMed = pct(r.toksPerSec, 50);
+    const tokMean = mean(r.toksPerSec);
     const row = [
       pad(r.label, cols[0]!.w, true),
       pad(String(r.rowsMeasured), cols[1]!.w),
@@ -184,8 +188,10 @@ function printComparison(results: RunResult[]) {
       pad(fmt(pct(r.elapsedMs, 99)) + " ms", cols[4]!.w),
       pad(fmt(mean(r.elapsedMs)) + " ms", cols[5]!.w),
       pad(fmt(reqPerS, 2), cols[6]!.w),
-      pad(speedup >= 1 ? fmt(speedup, 2) + "×" : "1/" + fmt(1 / speedup, 2) + "×", cols[7]!.w),
-      pad(r.coldFirstRowMs == null ? "—" : fmt(r.coldFirstRowMs / 1000, 2) + " s", cols[8]!.w),
+      pad(fmt(tokMed, 0), cols[7]!.w),
+      pad(fmt(tokMean, 0), cols[8]!.w),
+      pad(speedup >= 1 ? fmt(speedup, 2) + "×" : "1/" + fmt(1 / speedup, 2) + "×", cols[9]!.w),
+      pad(r.coldFirstRowMs == null ? "—" : fmt(r.coldFirstRowMs / 1000, 2) + " s", cols[10]!.w),
     ];
     console.log(row.join("  "));
   }
@@ -280,6 +286,12 @@ async function main() {
         median: pct(r.tokens, 50),
         mean: mean(r.tokens),
         p99: pct(r.tokens, 99),
+      },
+      tokens_per_sec: {
+        median: pct(r.toksPerSec, 50),
+        mean: mean(r.toksPerSec),
+        p10: pct(r.toksPerSec, 10),
+        p90: pct(r.toksPerSec, 90),
       },
       wall_total_ms: r.wallTotalMs,
       throughput_req_per_s: r.rows / (r.wallTotalMs / 1000),
