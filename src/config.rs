@@ -27,6 +27,8 @@ pub struct ModelConfig {
     pub rope_parameters: RopeParameters,
     #[serde(default = "default_swiglu_limit")]
     pub swiglu_limit: f32,
+    #[serde(default)]
+    pub num_labels: Option<usize>,
 }
 
 fn default_swiglu_limit() -> f32 {
@@ -41,6 +43,6 @@ impl ModelConfig {
     }
 
     pub fn num_classes(&self) -> usize {
-        33
+        self.num_labels.unwrap_or(33)
     }
 }

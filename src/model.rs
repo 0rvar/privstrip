@@ -9,6 +9,20 @@ use candle_nn::{Linear, Module, RmsNorm, VarBuilder, ops};
 use crate::config::ModelConfig;
 use crate::timing::{Stage, time_stage};
 
+/// Tensor naming convention on disk.
+///
+/// `Custom` is the layout shipped by `openai/privacy-filter` itself: a fused
+/// `block.{i}.attn.qkv` projection, scale-named norms, no classifier bias.
+/// `Hf` is the standard `transformers` MoE serialization used by community
+/// fine-tunes such as `OpenMed/privacy-filter-multilingual`: separate
+/// `q_proj`/`k_proj`/`v_proj`, weight-named norms, and a `score` head with bias.
+/// The math is identical; only the on-disk packing differs.
+#[derive(Debug, Clone, Copy)]
+enum Naming {
+    Custom,
+    Hf,
+}
+
 pub struct Transformer {
     pub embedding: Tensor,
     pub blocks: Vec<TransformerBlock>,
@@ -23,6 +37,10 @@ pub struct Transformer {
     // contiguous form; doing the transpose+contiguous once at load-time saves
     // the copy on every forward.
     unembedding_t: Tensor,
+    // Optional classifier-head bias. The base checkpoint's `unembedding` is a
+    // bare matmul; HF-naming checkpoints (e.g. OpenMed multilingual) add a
+    // `score.bias` from `nn.Linear`.
+    unembedding_b: Option<Tensor>,
 }
 
 pub struct TransformerBlock {
@@ -67,25 +85,52 @@ impl Transformer {
                 .with_context(|| format!("load {}", weights_path.display()))?
         };
 
-        let embedding = vb.get((config.vocab_size, config.hidden_size), "embedding.weight")?;
-        let final_scale = vb.get(config.hidden_size, "norm.scale")?;
+        let naming = if vb.contains_tensor("embedding.weight") {
+            Naming::Custom
+        } else if vb.contains_tensor("model.embed_tokens.weight") {
+            Naming::Hf
+        } else {
+            anyhow::bail!(
+                "could not detect tensor naming convention: neither `embedding.weight` \
+                 (openai/privacy-filter) nor `model.embed_tokens.weight` (HF MoE) found"
+            );
+        };
+
+        let (embedding, final_scale, unembedding, unembedding_b) = match naming {
+            Naming::Custom => {
+                let e = vb.get((config.vocab_size, config.hidden_size), "embedding.weight")?;
+                let n = vb.get(config.hidden_size, "norm.scale")?;
+                let u = vb.get((config.num_classes(), config.hidden_size), "unembedding.weight")?;
+                (e, n, u, None)
+            }
+            Naming::Hf => {
+                let e = vb.get((config.vocab_size, config.hidden_size), "model.embed_tokens.weight")?;
+                let n = vb.get(config.hidden_size, "model.norm.weight")?;
+                let u = vb.get((config.num_classes(), config.hidden_size), "score.weight")?;
+                let b = vb.get(config.num_classes(), "score.bias")?;
+                (e, n, u, Some(b))
+            }
+        };
         let final_norm = RmsNorm::new(final_scale, config.rms_norm_eps);
-        let unembedding =
-            vb.get((config.num_classes(), config.hidden_size), "unembedding.weight")?;
 
         let (rope_cos, rope_sin) = build_yarn_rope(&config, &device, dtype)?;
 
         let mut blocks = Vec::with_capacity(config.num_hidden_layers);
         let sliding_window = config.sliding_window;
         for i in 0..config.num_hidden_layers {
-            let block_vb = vb.pp(format!("block.{i}"));
+            let (block_vb, attn_prefix, mlp_prefix) = match naming {
+                Naming::Custom => (vb.pp(format!("block.{i}")), "attn", "mlp"),
+                Naming::Hf => (vb.pp(format!("model.layers.{i}")), "self_attn", "mlp"),
+            };
             let attn = AttentionBlock::load(
-                &block_vb.pp("attn"),
+                &block_vb.pp(attn_prefix),
                 &config,
                 rope_cos.clone(),
                 rope_sin.clone(),
+                naming,
+                &block_vb,
             )?;
-            let mlp = MLPBlock::load(&block_vb.pp("mlp"), &config)?;
+            let mlp = MLPBlock::load(&block_vb.pp(mlp_prefix), &config, naming, &block_vb)?;
             blocks.push(TransformerBlock { attn, mlp });
         }
 
@@ -95,6 +140,7 @@ impl Transformer {
             blocks,
             final_norm,
             unembedding_t,
+            unembedding_b,
             sliding_window,
             mask_cache: Mutex::new(HashMap::new()),
         })
@@ -132,7 +178,10 @@ impl Transformer {
             x = block.mlp.forward(&x)?;
         }
         let x = self.final_norm.forward(&x)?;
-        let logits = x.matmul(&self.unembedding_t)?; // [T, num_classes]
+        let mut logits = x.matmul(&self.unembedding_t)?; // [T, num_classes]
+        if let Some(b) = &self.unembedding_b {
+            logits = logits.broadcast_add(b)?;
+        }
         Ok(logits)
     }
 
@@ -148,6 +197,8 @@ impl AttentionBlock {
         config: &ModelConfig,
         rope_cos: Tensor,
         rope_sin: Tensor,
+        naming: Naming,
+        block_vb: &VarBuilder,
     ) -> Result<Self> {
         let h = config.hidden_size;
         let nq = config.num_attention_heads;
@@ -155,18 +206,39 @@ impl AttentionBlock {
         let d = config.head_dim;
         let qkv_dim = (nq + 2 * nkv) * d;
 
-        let norm_scale = vb.pp("norm").get(h, "scale")?;
+        let (norm_scale, qkv_w, qkv_b, out_w, out_b, sinks) = match naming {
+            Naming::Custom => {
+                let n = vb.pp("norm").get(h, "scale")?;
+                let qkv_w = vb.pp("qkv").get((qkv_dim, h), "weight")?;
+                let qkv_b = vb.pp("qkv").get(qkv_dim, "bias")?;
+                let out_w = vb.pp("out").get((h, nq * d), "weight")?;
+                let out_b = vb.pp("out").get(h, "bias")?;
+                let sinks = vb.get(nq, "sinks")?;
+                (n, qkv_w, qkv_b, out_w, out_b, sinks)
+            }
+            Naming::Hf => {
+                // input_layernorm sits at block-level, not inside self_attn.
+                let n = block_vb.pp("input_layernorm").get(h, "weight")?;
+                // Concatenate q/k/v along dim 0 to match the fused layout the
+                // forward pass slices with narrow().
+                let q_w = vb.pp("q_proj").get((nq * d, h), "weight")?;
+                let k_w = vb.pp("k_proj").get((nkv * d, h), "weight")?;
+                let v_w = vb.pp("v_proj").get((nkv * d, h), "weight")?;
+                let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.contiguous()?;
+                let q_b = vb.pp("q_proj").get(nq * d, "bias")?;
+                let k_b = vb.pp("k_proj").get(nkv * d, "bias")?;
+                let v_b = vb.pp("v_proj").get(nkv * d, "bias")?;
+                let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?.contiguous()?;
+                let out_w = vb.pp("o_proj").get((h, nq * d), "weight")?;
+                let out_b = vb.pp("o_proj").get(h, "bias")?;
+                let sinks = vb.get(nq, "sinks")?;
+                (n, qkv_w, qkv_b, out_w, out_b, sinks)
+            }
+        };
+
         let norm = RmsNorm::new(norm_scale, config.rms_norm_eps);
-
-        let qkv_w = vb.pp("qkv").get((qkv_dim, h), "weight")?;
-        let qkv_b = vb.pp("qkv").get(qkv_dim, "bias")?;
         let qkv = Linear::new(qkv_w, Some(qkv_b));
-
-        let out_w = vb.pp("out").get((h, nq * d), "weight")?;
-        let out_b = vb.pp("out").get(h, "bias")?;
         let out = Linear::new(out_w, Some(out_b));
-
-        let sinks = vb.get(nq, "sinks")?; // f32 in checkpoint, loaded as configured dtype
 
         Ok(Self {
             norm,
@@ -263,23 +335,46 @@ impl AttentionBlock {
 }
 
 impl MLPBlock {
-    fn load(vb: &VarBuilder, config: &ModelConfig) -> Result<Self> {
+    fn load(
+        vb: &VarBuilder,
+        config: &ModelConfig,
+        naming: Naming,
+        block_vb: &VarBuilder,
+    ) -> Result<Self> {
         let h = config.hidden_size;
         let inter = config.intermediate_size;
         let ne = config.num_local_experts;
 
-        let norm_scale = vb.pp("norm").get(h, "scale")?;
+        let (norm_scale, gate_w, gate_b, mlp1_weight, mlp1_bias, mlp2_weight, mlp2_bias) =
+            match naming {
+                Naming::Custom => {
+                    let n = vb.pp("norm").get(h, "scale")?;
+                    let gw = vb.pp("gate").get((ne, h), "weight")?;
+                    let gb = vb.pp("gate").get(ne, "bias")?;
+                    // gpt-oss expert layout: x @ W (W is [in, out], not the standard PyTorch [out, in]).
+                    let m1w = vb.pp("swiglu").get((ne, h, 2 * inter), "weight")?;
+                    let m1b = vb.pp("swiglu").get((ne, 2 * inter), "bias")?;
+                    let m2w = vb.pp("out").get((ne, inter, h), "weight")?;
+                    let m2b = vb.pp("out").get((ne, h), "bias")?;
+                    (n, gw, gb, m1w, m1b, m2w, m2b)
+                }
+                Naming::Hf => {
+                    // post_attention_layernorm sits at block-level, not inside mlp.
+                    let n = block_vb.pp("post_attention_layernorm").get(h, "weight")?;
+                    let gw = vb.pp("router").get((ne, h), "weight")?;
+                    let gb = vb.pp("router").get(ne, "bias")?;
+                    // HF MoE serialization stores experts in the same [E, in, out]
+                    // layout as gpt-oss, so we can load directly without a transpose.
+                    let m1w = vb.pp("experts").get((ne, h, 2 * inter), "gate_up_proj")?;
+                    let m1b = vb.pp("experts").get((ne, 2 * inter), "gate_up_proj_bias")?;
+                    let m2w = vb.pp("experts").get((ne, inter, h), "down_proj")?;
+                    let m2b = vb.pp("experts").get((ne, h), "down_proj_bias")?;
+                    (n, gw, gb, m1w, m1b, m2w, m2b)
+                }
+            };
+
         let norm = RmsNorm::new(norm_scale, config.rms_norm_eps);
-
-        let gate_w = vb.pp("gate").get((ne, h), "weight")?;
-        let gate_b = vb.pp("gate").get(ne, "bias")?;
         let gate = Linear::new(gate_w, Some(gate_b));
-
-        // gpt-oss expert layout: x @ W (W is [in, out], not the standard PyTorch [out, in]).
-        let mlp1_weight = vb.pp("swiglu").get((ne, h, 2 * inter), "weight")?;
-        let mlp1_bias = vb.pp("swiglu").get((ne, 2 * inter), "bias")?;
-        let mlp2_weight = vb.pp("out").get((ne, inter, h), "weight")?;
-        let mlp2_bias = vb.pp("out").get((ne, h), "bias")?;
 
         Ok(Self {
             norm,

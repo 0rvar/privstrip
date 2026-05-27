@@ -378,8 +378,13 @@ function parseCli(): Args {
       corpus: { type: "string", default: join(PROJECT_ROOT, "scripts/corpus.jsonl") },
       "privstrip-bin": { type: "string", default: join(PROJECT_ROOT, "target/release/privstrip") },
       "python-script": { type: "string", default: join(PROJECT_ROOT, "python-ref/run_reference.py") },
-      "model-dir": { type: "string", default: join(PROJECT_ROOT, "models") },
-      cache: { type: "string", default: join(PROJECT_ROOT, "scripts/.python-cache.jsonl") },
+      "model-dir": { type: "string", default: join(PROJECT_ROOT, "models/base") },
+      // The python cache stores per-row spans from the OPF reference; spans
+      // are model-specific (different label sets), so swapping models without
+      // a fresh cache will produce nonsense agreement numbers. We default the
+      // cache filename to reflect the model dir's basename so each model gets
+      // its own cache file.
+      cache: { type: "string" },
       fetch: { type: "string", default: "500" },
       "max-rows": { type: "string" },
       "max-bytes": { type: "string", default: "8192" },
@@ -405,8 +410,8 @@ Options:
   --corpus <path>           Corpus JSONL (default scripts/corpus.jsonl)
   --privstrip-bin <path>    Rust binary
   --python-script <path>    python-ref/run_reference.py
-  --model-dir <path>        models/
-  --cache <path>            Python results cache (JSONL: {decoder, id, spans, decoded_mismatch})
+  --model-dir <path>        Directory containing model.safetensors etc. (default models/base)
+  --cache <path>            Python results cache (default scripts/.python-cache-<modelname>.jsonl)
   --fetch <n>               Rows to fetch on first run if corpus is missing (default 500)
   --max-rows <n>            Limit rows
   --max-bytes <n>           Skip rows above this UTF-8 size (default 8192)
@@ -426,7 +431,12 @@ Options:
     privstripBin: values["privstrip-bin"] as string,
     pythonScript: values["python-script"] as string,
     modelDir: values["model-dir"] as string,
-    cache: values.cache as string,
+    cache:
+      (values.cache as string | undefined) ??
+      join(
+        PROJECT_ROOT,
+        `scripts/.python-cache-${(values["model-dir"] as string).split("/").filter(Boolean).pop()}.jsonl`,
+      ),
     fetch: Number(values.fetch),
     maxRows: values["max-rows"] ? Number(values["max-rows"]) : Infinity,
     maxBytes: Number(values["max-bytes"]),

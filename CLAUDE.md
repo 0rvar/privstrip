@@ -24,12 +24,13 @@ The model recognizes 8 entity types (`account_number`, `private_address`, `priva
   - `spans.rs` — token-id → byte-span extraction, whitespace trimming, dedup
   - `config.rs` — model-config deserialization
   - `timing.rs` — opt-in per-stage wall-clock instrumentation gated by `PRIVSTRIP_TIMING=1`
-- `models/` — model artifacts (gitignored)
-  - `model.safetensors` (~2.8 GB bf16) — the weights we actually use
-  - `tokenizer.json`, `tokenizer_config.json` — o200k_base BPE
-  - `config.json` — architecture hyperparameters and `id2label`
-  - `viterbi_calibration.json` — Viterbi transition biases. Auto-loaded at startup; the shipped `default` operating point has all-zero biases (a no-op vs constraint-only decoding). Override with `--operating-point <name>`.
-  - `onnx/` — ONNX export from upstream (kept for the validation oracle to load via transformers.js, see below). Candle cannot run the ONNX (see "What didn't work")
+- `models/` — model artifacts (gitignored). One subdirectory per checkpoint. Each subdir contains:
+    - `model.safetensors` (~2.8 GB bf16)
+    - `tokenizer.json`, `tokenizer_config.json` — o200k_base BPE (identical across checkpoints in this family)
+    - `config.json` — architecture hyperparameters and `id2label`
+    - `viterbi_calibration.json` — Viterbi transition biases. Auto-loaded at startup; the shipped `default` operating point has all-zero biases (a no-op vs constraint-only decoding). Override with `--operating-point <name>`.
+  - `models/base/` — `openai/privacy-filter` upstream weights. Custom on-disk tensor naming (`block.{i}.attn.qkv.weight` etc.). 33 BIES classes for 8 PII categories. **The default `--model-dir` and the only checkpoint validated against the OPF Python reference (C).** Also contains `onnx/` — ONNX export from upstream (kept for the transformers.js oracle, see below). Candle cannot run the ONNX (see "What didn't work").
+  - `models/multilingual/` — `OpenMed/privacy-filter-multilingual`. Same architecture but **HF-standard tensor naming** (`model.layers.{i}.self_attn.q_proj.weight` etc., separate Q/K/V, `score.{weight,bias}` classifier head). 217 BIES classes for 54 PII categories across 16 languages. The Rust loader detects naming via `vb.contains_tensor("embedding.weight")` and dispatches accordingly — both layouts share the same forward pass.
 - `python-ref/` — Python reference (oracle C). Standalone uv project that wraps the official `opf` package and exposes the same JSONL stream protocol as `privstrip stream`. See `python-ref/README.md`.
 - `flake.nix` — dev shell providing cargo + rustc + uv + python311 + bun + samply.
 - `scripts/`
@@ -53,24 +54,27 @@ The HF checkpoint is a custom `OpenAIPrivacyFilter` architecture, not a stock HF
 - YaRN RoPE with `factor = 32`, `original_max_position_embeddings = 4096`, `rope_theta = 150000`
 - Weights are bf16 on disk; we run forward in f32 for op coverage and headroom
 
-`config.num_classes()` is hard-coded to 33 — the architecture's BIES tag set is fixed for this model family.
+`config.num_classes()` reads `num_labels` from `config.json` if present and falls back to 33 (the upstream `openai/privacy-filter` config doesn't declare `num_labels` explicitly). The architecture itself is class-count agnostic — only the classifier head's leading dim changes.
 
 ## Build & run
 
 ```fish
 cargo build --release
 
-# string input
-target/release/privstrip check -t "Call John at 555-1234" -m models
+# string input (default model is models/base — openai/privacy-filter, 8 PII categories)
+target/release/privstrip check -t "Call John at 555-1234"
+
+# multilingual checkpoint with 54 categories and 16 languages
+target/release/privstrip check -t "Mein Name ist Klaus Müller" -m models/multilingual
 
 # stream JSONL over stdin
-echo '{"id":1,"text":"Call John at 555-1234"}' | target/release/privstrip stream -m models
+echo '{"id":1,"text":"Call John at 555-1234"}' | target/release/privstrip stream
 
 # Metal (Apple GPU) — off by default because some sandboxes can't init Metal
-target/release/privstrip --metal check -f input.txt -m models
+target/release/privstrip --metal check -f input.txt
 ```
 
-The default `--model-dir` is `models`. The default decoder is `viterbi`; `--decoder argmax` matches transformers.js's per-token-argmax pipeline (see "Decoder choice" below). `--operating-point <name>` selects a Viterbi calibration; the shipped default is `default` (all-zero biases).
+The default `--model-dir` is `models/base`. The default decoder is `viterbi`; `--decoder argmax` matches transformers.js's per-token-argmax pipeline (see "Decoder choice" below). `--operating-point <name>` selects a Viterbi calibration; the shipped default is `default` (all-zero biases).
 
 ## Validation
 

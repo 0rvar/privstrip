@@ -33,6 +33,8 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -47,10 +49,27 @@ def build_opf_config(hf_config: dict) -> dict:
     rope = hf_config["rope_parameters"]
     sliding_half = int(hf_config["sliding_window"])
     bandwidth = sliding_half * 2 + 1
-    return {
+    # Upstream openai/privacy-filter ships `encoding: "o200k_base"` at top
+    # level. OpenMed/privacy-filter-multilingual leaves the top-level slot
+    # null and exposes the same value under opf_metadata.encoding instead.
+    opf_metadata = hf_config.get("opf_metadata") or {}
+    encoding = hf_config.get("encoding") or opf_metadata.get("encoding")
+    if encoding is None:
+        raise ValueError("config.json has no `encoding` or `opf_metadata.encoding` field")
+
+    # OPF resolves the label space either from a known `category_version`
+    # (33/57/101 classes) or from explicit top-level `span_class_names` /
+    # `ner_class_names`. The multilingual checkpoint's 217 classes are not a
+    # built-in version, so we promote the names from `opf_metadata` to top
+    # level to trigger OPF's custom-label-space path.
+    custom_span_class_names = opf_metadata.get("span_class_names")
+    custom_ner_class_names = opf_metadata.get("ner_class_names")
+    custom_category_version = opf_metadata.get("category_version")
+
+    out: dict = {
         # opf REQUIRED_ENCODER_CONFIG_KEYS
         "model_type": "privacy_filter",
-        "encoding": hf_config["encoding"],
+        "encoding": encoding,
         "num_hidden_layers": hf_config["num_hidden_layers"],
         "num_experts": hf_config["num_local_experts"],
         "experts_per_token": hf_config["num_experts_per_tok"],
@@ -83,13 +102,101 @@ def build_opf_config(hf_config: dict) -> dict:
         "default_n_ctx": int(hf_config.get("default_n_ctx", 8192)),
         "swiglu_limit": float(hf_config.get("swiglu_limit", 7.0)),
     }
+    if custom_span_class_names is not None:
+        out["span_class_names"] = list(custom_span_class_names)
+    if custom_ner_class_names is not None:
+        out["ner_class_names"] = list(custom_ner_class_names)
+    if custom_category_version is not None:
+        out["category_version"] = str(custom_category_version)
+    return out
+
+
+def _is_hf_naming(weights_path: Path) -> bool:
+    with safe_open(str(weights_path), framework="pt") as f:
+        return "model.embed_tokens.weight" in set(f.keys())
+
+
+def _convert_hf_to_opf_weights(
+    src: Path,
+    dst_weights: Path,
+    classifier_bias_dst: Path,
+    num_layers: int,
+) -> bool:
+    """Rewrite an HF-naming safetensors as an OPF-naming safetensors.
+
+    Returns True if the source had a classifier-head bias (`score.bias`), which
+    OPF's bias-free unembedding cannot honor — load_reference adds that bias
+    back via a forward hook so logits match the rust port byte-for-byte.
+
+    Tensor mappings (HF → OPF):
+      model.embed_tokens.weight                              → embedding.weight
+      model.norm.weight                                      → norm.scale
+      score.weight                                           → unembedding.weight
+      score.bias                                             → (sidecar) unembedding.bias
+      model.layers.{i}.input_layernorm.weight                → block.{i}.attn.norm.scale
+      model.layers.{i}.post_attention_layernorm.weight       → block.{i}.mlp.norm.scale
+      model.layers.{i}.self_attn.{q,k,v}_proj.{weight,bias}  → cat → block.{i}.attn.qkv.{weight,bias}
+      model.layers.{i}.self_attn.o_proj.{weight,bias}        → block.{i}.attn.out.{weight,bias}
+      model.layers.{i}.self_attn.sinks                       → block.{i}.attn.sinks
+      model.layers.{i}.mlp.router.{weight,bias}              → block.{i}.mlp.gate.{weight,bias}
+      model.layers.{i}.mlp.experts.gate_up_proj{,_bias}      → block.{i}.mlp.swiglu.{weight,bias}
+      model.layers.{i}.mlp.experts.down_proj{,_bias}         → block.{i}.mlp.out.{weight,bias}
+    """
+    tensors: dict[str, torch.Tensor] = {}
+    classifier_bias: torch.Tensor | None = None
+    with safe_open(str(src), framework="pt") as f:
+        keys = set(f.keys())
+        tensors["embedding.weight"] = f.get_tensor("model.embed_tokens.weight")
+        tensors["norm.scale"] = f.get_tensor("model.norm.weight")
+        tensors["unembedding.weight"] = f.get_tensor("score.weight")
+        if "score.bias" in keys:
+            classifier_bias = f.get_tensor("score.bias")
+
+        for i in range(num_layers):
+            sl = f"model.layers.{i}"
+            bl = f"block.{i}"
+            tensors[f"{bl}.attn.norm.scale"] = f.get_tensor(f"{sl}.input_layernorm.weight")
+            tensors[f"{bl}.mlp.norm.scale"] = f.get_tensor(f"{sl}.post_attention_layernorm.weight")
+            qw = f.get_tensor(f"{sl}.self_attn.q_proj.weight")
+            kw = f.get_tensor(f"{sl}.self_attn.k_proj.weight")
+            vw = f.get_tensor(f"{sl}.self_attn.v_proj.weight")
+            tensors[f"{bl}.attn.qkv.weight"] = torch.cat([qw, kw, vw], dim=0).contiguous()
+            qb = f.get_tensor(f"{sl}.self_attn.q_proj.bias")
+            kb = f.get_tensor(f"{sl}.self_attn.k_proj.bias")
+            vb = f.get_tensor(f"{sl}.self_attn.v_proj.bias")
+            tensors[f"{bl}.attn.qkv.bias"] = torch.cat([qb, kb, vb], dim=0).contiguous()
+            tensors[f"{bl}.attn.out.weight"] = f.get_tensor(f"{sl}.self_attn.o_proj.weight")
+            tensors[f"{bl}.attn.out.bias"] = f.get_tensor(f"{sl}.self_attn.o_proj.bias")
+            tensors[f"{bl}.attn.sinks"] = f.get_tensor(f"{sl}.self_attn.sinks")
+            tensors[f"{bl}.mlp.gate.weight"] = f.get_tensor(f"{sl}.mlp.router.weight")
+            tensors[f"{bl}.mlp.gate.bias"] = f.get_tensor(f"{sl}.mlp.router.bias")
+            tensors[f"{bl}.mlp.swiglu.weight"] = f.get_tensor(f"{sl}.mlp.experts.gate_up_proj")
+            tensors[f"{bl}.mlp.swiglu.bias"] = f.get_tensor(f"{sl}.mlp.experts.gate_up_proj_bias")
+            tensors[f"{bl}.mlp.out.weight"] = f.get_tensor(f"{sl}.mlp.experts.down_proj")
+            tensors[f"{bl}.mlp.out.bias"] = f.get_tensor(f"{sl}.mlp.experts.down_proj_bias")
+
+    save_file(tensors, str(dst_weights))
+    if classifier_bias is not None:
+        save_file({"unembedding.bias": classifier_bias}, str(classifier_bias_dst))
+        return True
+    if classifier_bias_dst.exists():
+        classifier_bias_dst.unlink()
+    return False
 
 
 def materialize_opf_checkpoint(src_models_dir: Path, dst_dir: Path) -> Path:
     """Build a side-car checkpoint dir that opf can load.
 
-    The dir contains a translated config.json plus a symlink to the original
-    safetensors weights. The original directory is left untouched.
+    For an upstream-naming checkpoint (openai/privacy-filter), the dir contains
+    a translated config.json plus a symlink to the original safetensors weights.
+
+    For an HF-naming checkpoint (e.g. OpenMed/privacy-filter-multilingual), the
+    weights are rewritten into OPF's expected naming, and any classifier-head
+    bias is split out into a sidecar that load_reference applies via a forward
+    hook (OPF's unembedding is `bias=False` and silently drops it otherwise).
+
+    Conversion is cached on src mtime so swapping models doesn't pay the rewrite
+    cost on every load. The original models/ directory is left untouched.
     """
     dst_dir.mkdir(parents=True, exist_ok=True)
     src_config = json.loads((src_models_dir / "config.json").read_text())
@@ -97,10 +204,34 @@ def materialize_opf_checkpoint(src_models_dir: Path, dst_dir: Path) -> Path:
     (dst_dir / "config.json").write_text(json.dumps(opf_config, indent=2))
 
     src_weights = (src_models_dir / "model.safetensors").resolve()
-    link = dst_dir / "model.safetensors"
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(src_weights)
+    dst_weights = dst_dir / "model.safetensors"
+    classifier_bias_path = dst_dir / "classifier_bias.safetensors"
+
+    if _is_hf_naming(src_weights):
+        # Rewrite once; reuse on subsequent loads. Stale check uses src mtime.
+        needs_rewrite = (
+            not dst_weights.exists()
+            or dst_weights.is_symlink()  # leftover from a base-model load — replace with a real file
+            or src_weights.stat().st_mtime > dst_weights.stat().st_mtime
+        )
+        if needs_rewrite:
+            log(f"converting HF-naming weights → OPF naming at {dst_weights}...")
+            if dst_weights.is_symlink() or dst_weights.exists():
+                dst_weights.unlink()
+            _convert_hf_to_opf_weights(
+                src_weights,
+                dst_weights,
+                classifier_bias_path,
+                num_layers=int(src_config["num_hidden_layers"]),
+            )
+    else:
+        if dst_weights.is_symlink() or dst_weights.exists():
+            dst_weights.unlink()
+        dst_weights.symlink_to(src_weights)
+        # If we previously converted an HF checkpoint into this workdir, drop
+        # the stale classifier bias so it doesn't leak into a base-model load.
+        if classifier_bias_path.exists():
+            classifier_bias_path.unlink()
     return dst_dir
 
 
@@ -123,7 +254,7 @@ def load_reference(
     # Defer the import so --help works even if opf isn't installed.
     from opf import OPF, DecodeOptions  # noqa: F401
 
-    workdir = REPO_ROOT / "python-ref" / ".opf-checkpoint"
+    workdir = REPO_ROOT / "python-ref" / f".opf-checkpoint-{models_dir.name}"
     materialize_opf_checkpoint(models_dir, workdir)
 
     opf_obj = OPF(
@@ -138,6 +269,24 @@ def load_reference(
         opf_obj.set_viterbi_decoder(calibration_path=str(calibration_path))
 
     runtime, dec = opf_obj.get_prediction_components()
+
+    # OPF's classifier head is bias=False (opf/_model/model.py: `self.unembedding
+    # = nn.Linear(..., bias=False)` and `F.linear(x, self.unembedding.weight,
+    # None)`). HF-naming checkpoints (multilingual etc.) carry a `score.bias`
+    # that we extracted into a sidecar at materialize time; add it back via a
+    # forward hook so the python reference matches the rust port (which already
+    # honors the bias).
+    classifier_bias_path = workdir / "classifier_bias.safetensors"
+    if classifier_bias_path.exists():
+        with safe_open(str(classifier_bias_path), framework="pt") as f:
+            bias = f.get_tensor("unembedding.bias")
+        target_device = next(runtime.model.parameters()).device
+        target_dtype = next(runtime.model.parameters()).dtype
+        bias = bias.to(device=target_device, dtype=target_dtype)
+        runtime.model.register_forward_hook(
+            lambda _module, _inputs, output: output + bias
+        )
+
     return Reference(
         opf_obj=opf_obj,
         runtime=runtime,
@@ -275,7 +424,7 @@ def run_debug(ref: Reference, text: str) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=["stream", "debug"], default="stream", nargs="?")
-    p.add_argument("-m", "--model-dir", type=Path, default=REPO_ROOT / "models")
+    p.add_argument("-m", "--model-dir", type=Path, default=REPO_ROOT / "models/base")
     p.add_argument("--decoder", choices=["viterbi", "argmax"], default="viterbi")
     p.add_argument(
         "--context-window-length",

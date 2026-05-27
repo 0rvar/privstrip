@@ -70,7 +70,7 @@ Options:
     });
   }
 
-  const cachePath = join(PROJECT_ROOT, "scripts/.python-cache.jsonl");
+  const cachePath = join(PROJECT_ROOT, "scripts/.python-cache-base.jsonl");
   if (!existsSync(cachePath)) {
     console.error(
       `error: ${cachePath} not found. Populate the python cache first:\n` +

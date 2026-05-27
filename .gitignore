@@ -7,12 +7,15 @@ node_modules/
 
 # python-ref
 python-ref/.venv/
-python-ref/.opf-checkpoint/
+# OPF materialization workdirs — one per model dir (e.g. .opf-checkpoint-base,
+# .opf-checkpoint-multilingual). Each holds a rewritten safetensors and is
+# derivable from models/, so it stays out of git.
+python-ref/.opf-checkpoint*/
 python-ref/__pycache__/
 python-ref/.python-version
 
-# three-way-validate cache (large)
-scripts/.python-cache.jsonl
+# three-way-validate cache (large) — one per model dir, named for the dir's basename.
+scripts/.python-cache*.jsonl
 
 .direnv/
 /result

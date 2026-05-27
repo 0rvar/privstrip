@@ -210,7 +210,7 @@ async function main() {
     options: {
       corpus: { type: "string", default: join(PROJECT_ROOT, "scripts/corpus.jsonl") },
       bin: { type: "string", default: join(PROJECT_ROOT, "target/release/privstrip") },
-      "model-dir": { type: "string", default: join(PROJECT_ROOT, "models") },
+      "model-dir": { type: "string", default: join(PROJECT_ROOT, "models/base") },
       "max-rows": { type: "string", default: "100" },
       "max-bytes": { type: "string", default: "8192" },
       "skip-python": { type: "boolean", default: false },
