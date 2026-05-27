@@ -49,13 +49,12 @@ def build_opf_config(hf_config: dict) -> dict:
     rope = hf_config["rope_parameters"]
     sliding_half = int(hf_config["sliding_window"])
     bandwidth = sliding_half * 2 + 1
-    # Upstream openai/privacy-filter ships `encoding: "o200k_base"` at top
-    # level. OpenMed/privacy-filter-multilingual leaves the top-level slot
-    # null and exposes the same value under opf_metadata.encoding instead.
+    # OpenMed/privacy-filter-multilingual exposes the tokenizer name under
+    # opf_metadata.encoding. Upstream openai/privacy-filter's config.json
+    # carries neither field, so default to o200k_base — the tokenizer it
+    # ships with tokenizer.json.
     opf_metadata = hf_config.get("opf_metadata") or {}
-    encoding = hf_config.get("encoding") or opf_metadata.get("encoding")
-    if encoding is None:
-        raise ValueError("config.json has no `encoding` or `opf_metadata.encoding` field")
+    encoding = hf_config.get("encoding") or opf_metadata.get("encoding") or "o200k_base"
 
     # OPF resolves the label space either from a known `category_version`
     # (33/57/101 classes) or from explicit top-level `span_class_names` /
