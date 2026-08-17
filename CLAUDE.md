@@ -1,6 +1,8 @@
 # privstrip
 
-A Rust CLI for detecting personally identifiable information (PII) in text using the [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) model. Runs the model directly via candle + safetensors — no Python, no ONNX runtime.
+A Rust **library and CLI** for detecting personally identifiable information (PII) in text using the [openai/privacy-filter](https://huggingface.co/openai/privacy-filter) model. Runs the model directly via candle + safetensors — no Python, no ONNX runtime.
+
+The library is the inference engine and nothing else. The HTTP service that wraps it for deployment lives in the Timely infra repo at `services/privstrip` — see "HTTP service" below.
 
 ## What it is
 
@@ -17,7 +19,9 @@ The model recognizes 8 entity types (`account_number`, `private_address`, `priva
 ## Layout
 
 - `src/` — Rust source
-  - `main.rs` — CLI, I/O, run modes
+  - `lib.rs` — the library surface: what `services/privstrip` in the infra repo consumes
+  - `engine.rs` — `Engine`: tokenize → forward → decode → extract spans, plus the shared JSON envelope
+  - `main.rs` — CLI only: arg parsing, I/O, run modes. Consumes the library like any other dependent.
   - `model.rs` — custom transformer architecture (GQA + sparse MoE + YaRN RoPE + bidirectional sliding-window attention)
   - `viterbi.rs` — constraint-aware BIES decoder
   - `labels.rs` — config-driven label/boundary metadata
@@ -75,6 +79,35 @@ target/release/privstrip --metal check -f input.txt
 ```
 
 The default `--model-dir` is `models/base`. The default decoder is `viterbi`; `--decoder argmax` matches transformers.js's per-token-argmax pipeline (see "Decoder choice" below). `--operating-point <name>` selects a Viterbi calibration; the shipped default is `default` (all-zero biases).
+
+### Cargo features
+
+`default = ["apple"]`, and `apple` turns on candle's `accelerate` + `metal` backends. Those link against macOS frameworks and do not build on Linux, so Linux and container builds use `cargo build --release --no-default-features`. No `#[cfg]` in `src/` depends on the feature: candle ships a stub Metal backend, so `--metal` simply errors at runtime when the feature is off. `cargo check --release --no-default-features` on a Mac is a cheap way to confirm the Linux dependency graph still resolves.
+
+## HTTP service (separate repo)
+
+There is no serve mode in this crate. The HTTP service lives in the Timely infra
+repo at `services/privstrip` and depends on this crate as a library:
+
+```toml
+privstrip = { git = "https://github.com/0rvar/privstrip", rev = "..." }
+```
+
+That crate (`privstrip-service`) owns everything deployment-shaped: the axum
+server, `/health` and `/v1/detect`, the S3/Hugging Face weights bootstrap and its
+`weights-manifest.json`, the request limits, the Dockerfile, and the ECS deploy
+script. Its README documents the env contract and the API. **If you change the
+library API here, that crate pins a git rev and has to be bumped** — a lib change
+is not live until `services/privstrip/Cargo.toml` moves to a new rev and CI
+rebuilds the image.
+
+What this crate exposes for it (see `src/lib.rs`): `Engine` (`load`, `detect`
+taking a per-call `DecoderMode` + operating point, `count_tokens`,
+`operating_points`, `decoder_for`), `DecoderMode`, `DetectedSpan`,
+`DetectionResult`, `detection_json`/`detection_error_json` (the per-item envelope
+`stream` mode and the HTTP endpoint share, so the two protocols cannot drift),
+`pick_device`, a re-exported candle `Device`, and the `config`/`labels`/`model`/
+`spans`/`timing`/`viterbi` modules.
 
 ## Validation
 

@@ -49,7 +49,35 @@ Common flags:
 - `--metal` — use Apple GPU (off by default; cold-start is ~12–15 s for kernel compilation)
 - `--operating-point <name>` — Viterbi calibration profile from `viterbi_calibration.json`
 
-`stream` is the throughput mode — every other mode spins up the model for one shot. Bench results in [BENCHMARKS.md](BENCHMARKS.md).
+`stream` is the throughput mode for one-off batch work — every other one-shot mode spins up the model just to handle a single input. Bench results in [BENCHMARKS.md](BENCHMARKS.md).
+
+## HTTP service
+
+This crate is a library plus a CLI. The HTTP service is a separate crate in the
+Timely infra repo at `services/privstrip`, which depends on this one:
+
+```toml
+privstrip = { git = "https://github.com/0rvar/privstrip", rev = "..." }
+```
+
+`privstrip-service` owns the axum server (`GET /health`, `POST /v1/detect`), the
+S3-with-Hugging-Face-fallback weights bootstrap, the request limits, the container
+image, and the ECS deploy. See `services/privstrip/README.md` in that repo for the
+API and the environment contract.
+
+To embed detection in your own Rust program, depend on this crate directly:
+
+```rust
+use privstrip::{DecoderMode, Engine, DEFAULT_OPERATING_POINT, pick_device};
+
+let engine = Engine::load(Path::new("models/base"), pick_device(false)?)?;
+let result = engine.detect("Call John Smith at 555-1234", DecoderMode::Viterbi, DEFAULT_OPERATING_POINT)?;
+for span in &result.spans {
+    println!("{} {}..{} {:?}", span.label, span.byte_start, span.byte_end, span.text);
+}
+```
+
+Span offsets are byte offsets into the input text, not char indices.
 
 ## Scripts
 
@@ -106,6 +134,8 @@ It aggregates time across tokenize / forward (attn / moe_route / moe_route_sync 
 
 ```
 src/                      — Rust source
+  lib.rs                    Library surface (consumed by the infra repo service crate)
+  engine.rs                 Engine: tokenize → forward → decode → extract spans
   main.rs                   CLI + I/O + run modes
   model.rs                  Transformer (GQA + sparse MoE + YaRN + bidirectional sliding-window attn)
   viterbi.rs                BIES constraint-aware decoder

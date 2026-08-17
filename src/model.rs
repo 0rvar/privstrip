@@ -23,6 +23,19 @@ enum Naming {
     Hf,
 }
 
+/// Memory the attention-mask cache may retain before it is dropped wholesale.
+/// See `Transformer::cached_mask`.
+const MASK_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Bytes a dense `[T, T]` f32 sliding-window mask occupies.
+fn mask_bytes(t: usize) -> usize {
+    t.saturating_mul(t).saturating_mul(4)
+}
+
+fn cache_bytes(cache: &HashMap<usize, Tensor>) -> usize {
+    cache.keys().copied().map(mask_bytes).sum()
+}
+
 pub struct Transformer {
     pub embedding: Tensor,
     pub blocks: Vec<TransformerBlock>,
@@ -155,6 +168,20 @@ impl Transformer {
         }
         let m = bidirectional_sliding_mask(t, self.sliding_window, device, dtype)?;
         let mut cache = self.mask_cache.lock().unwrap();
+        // An entry costs 4*T^2 bytes — 1 GB at the T=16384 ceiling — so the
+        // budget has to be in bytes, not entries: 64 long inputs would be tens
+        // of GB. A long-lived server sees an unbounded spread of token counts,
+        // so drop the whole cache once the retained masks exceed the budget.
+        // Correctness never depends on a hit: the mask is a pure function of
+        // (T, window, device, dtype).
+        if cache_bytes(&cache) + mask_bytes(t) > MASK_CACHE_MAX_BYTES {
+            cache.clear();
+        }
+        // A mask too large to ever coexist with the budget is handed back
+        // uncached rather than evicting everything on every long request.
+        if mask_bytes(t) > MASK_CACHE_MAX_BYTES {
+            return Ok(m);
+        }
         Ok(cache.entry(t).or_insert(m).clone())
     }
 
